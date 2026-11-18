@@ -1,1 +1,1 @@
-# tinyQ
+# miniQ
