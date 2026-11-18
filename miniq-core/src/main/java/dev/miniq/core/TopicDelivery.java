@@ -22,6 +22,8 @@ public final class TopicDelivery {
 
     private final Topic topic;
     private final Clock clock;
+    private final DeadlineListener deadlineListener;
+    private volatile RuntimeException lastDeadlineListenerFailure;
     private final ReentrantLock lock = new ReentrantLock();
     // Redelivered offsets rejoin READY; selection always takes the lowest offset, not retry priority.
     private final TreeSet<Long> readyOffsets = new TreeSet<>();
@@ -35,8 +37,13 @@ public final class TopicDelivery {
      * Any messages already in its append-only log start READY.
      */
     public TopicDelivery(Topic topic, Clock clock) {
+        this(topic, clock, (topicName, offset, deliveryCount, deadline) -> { });
+    }
+
+    public TopicDelivery(Topic topic, Clock clock, DeadlineListener deadlineListener) {
         this.topic = Objects.requireNonNull(topic, "topic must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
+        this.deadlineListener = Objects.requireNonNull(deadlineListener, "deadlineListener must not be null");
         for (long offset = 0; offset < topic.nextOffset(); offset++) {
             if (topic.get(offset).isEmpty()) {
                 throw new IllegalStateException("topic log is missing offset " + offset);
@@ -109,6 +116,7 @@ public final class TopicDelivery {
 
     public Optional<Delivery> deliverNext(String subscriberId) {
         Objects.requireNonNull(subscriberId, "subscriberId must not be null");
+        Delivery delivery;
         lock.lock();
         try {
             // A disconnect race is expected: a released or not-yet-registered subscriber must not crash the caller.
@@ -130,7 +138,37 @@ public final class TopicDelivery {
             deliveryCounts.put(offset, deliveryCount);
             inFlightByOffset.put(offset, new InFlight(subscriberId, deliveryCount, deadline));
             subscriber.inFlightOffsets.add(offset);
-            return Optional.of(new Delivery(message, deliveryCount, deadline));
+            delivery = new Delivery(message, deliveryCount, deadline);
+        } finally {
+            lock.unlock();
+        }
+        // Notify after unlocking to avoid coupling topic state locking to the scheduler queue.
+        // Listener failure leaves the committed delivery IN_FLIGHT; expiry sweep or disconnect can recover it.
+        try {
+            deadlineListener.onDeadline(
+                    topic.name(), delivery.message().offset(), delivery.deliveryCount(), delivery.deadline());
+        } catch (RuntimeException failure) {
+            lastDeadlineListenerFailure = failure;
+        }
+        return Optional.of(delivery);
+    }
+
+    /** Requeues only the current in-flight attempt once its deadline has arrived. */
+    public boolean expireAttempt(long offset, int deliveryCount) {
+        lock.lock();
+        try {
+            InFlight current = inFlightByOffset.get(offset);
+            if (current == null || current.deliveryCount != deliveryCount || current.deadline.isAfter(clock.instant())) {
+                return false;
+            }
+
+            inFlightByOffset.remove(offset);
+            Subscriber subscriber = subscribers.get(current.subscriberId);
+            if (subscriber != null) {
+                subscriber.inFlightOffsets.remove(offset);
+            }
+            readyOffsets.add(offset);
+            return true;
         } finally {
             lock.unlock();
         }
@@ -238,6 +276,14 @@ public final class TopicDelivery {
         } finally {
             lock.unlock();
         }
+    }
+
+    String topicName() {
+        return topic.name();
+    }
+
+    RuntimeException lastDeadlineListenerFailure() {
+        return lastDeadlineListenerFailure;
     }
 
     private static void requireInvariant(boolean condition, String message) {

@@ -45,6 +45,35 @@ class TopicDeliveryTest {
     }
 
     @Test
+    void deadlineListenerFailureDoesNotLoseDeliveryAndManualSweepAllowsRedelivery() {
+        MutableClock clock = new MutableClock(START);
+        AtomicInteger listenerCalls = new AtomicInteger();
+        RuntimeException listenerFailure = new IllegalStateException("queue unavailable");
+        TopicDelivery delivery = new TopicDelivery(new Topic("orders"), clock,
+                (topicName, offset, deliveryCount, deadline) -> {
+                    if (listenerCalls.getAndIncrement() == 0) {
+                        throw listenerFailure;
+                    }
+                });
+        delivery.register("consumer", 100, 16);
+        Message message = delivery.publish("survive-listener-failure");
+
+        Delivery first = delivery.deliverNext("consumer").orElseThrow();
+        assertThat(first.message()).isEqualTo(message);
+        assertThat(delivery.lastDeadlineListenerFailure()).isSameAs(listenerFailure);
+        delivery.checkInvariants();
+
+        clock.advance(Duration.ofMillis(100));
+        assertThat(delivery.requeueExpired()).isEqualTo(1);
+        delivery.checkInvariants();
+        Delivery second = delivery.deliverNext("consumer").orElseThrow();
+        assertThat(second.message()).isEqualTo(message);
+        assertThat(second.deliveryCount()).isEqualTo(2);
+        assertThat(listenerCalls.get()).isEqualTo(2);
+        delivery.checkInvariants();
+    }
+
+    @Test
     void deliversReadyMessagesInOffsetOrder() {
         MutableClock clock = new MutableClock(START);
         TopicDelivery delivery = newDelivery(clock);
