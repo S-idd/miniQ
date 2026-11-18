@@ -101,3 +101,10 @@ Choose oldest READY offset first, while allowing timeout redelivery to rejoin th
 ## Open questions
 
 None currently.
+
+## Implementation notes
+
+- `Message` is immutable; `TopicName` applies the protocol topic-name rule.
+- `Topic` stores an in-memory append-only list with per-topic locking, gapless offsets, and UTF-8 PUBLISH line-size validation.
+- `TopicRegistry` safely creates and reuses topics under concurrent access.
+- Delivery state transitions, subscribers, acknowledgements, timeouts, schedulers, networking, and persistence are deliberately not built yet.
