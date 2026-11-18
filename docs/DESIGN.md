@@ -32,7 +32,7 @@ Every transition and trigger:
 | IN_FLIGHT | READY | The attempt's ack deadline is reached before a matching ACK is accepted. |
 | IN_FLIGHT | READY | The owning consumer connection disconnects or is declared closed, whichever occurs first relative to timeout. |
 
-ACKED is terminal: a message is never put back into READY. An ACK checks the current monotonic time against that attempt’s deadline while holding the topic lock. If the deadline has arrived, it performs the timeout transition and rejects the ACK even if the timeout worker has not yet awakened; otherwise a matching ACK can transition the message to ACKED. A later attempt has a higher delivery count.
+ACKED is terminal: a message is never put back into READY. An ACK checks the current time from the injected `Clock` against that attempt’s deadline while holding the topic lock. If the deadline has arrived, it rejects the ACK without changing state; `requeueExpired()` performs the IN_FLIGHT to READY transition. Otherwise a matching ACK can transition the message to ACKED. A later attempt has a higher delivery count.
 
 ## Offsets and log mapping
 
@@ -107,4 +107,12 @@ None currently.
 - `Message` is immutable; `TopicName` applies the protocol topic-name rule.
 - `Topic` stores an in-memory append-only list with per-topic locking, gapless offsets, and UTF-8 PUBLISH line-size validation.
 - `TopicRegistry` safely creates and reuses topics under concurrent access.
-- Delivery state transitions, subscribers, acknowledgements, timeouts, schedulers, networking, and persistence are deliberately not built yet.
+- At the end of Day 3, delivery states, subscribers, acknowledgements, and expiry handling were still deferred; scheduler threads, networking, and persistence remain deferred.
+
+## Implementation notes (Day 4)
+
+- `TopicDelivery` composes the append-only `Topic` with READY, IN_FLIGHT, and ACKED state under one delivery lock.
+- Delivery attempts carry a per-offset delivery count and a `Clock`-based deadline; ACK results retain internal detail and map invalid ACKs to the protocol's `ACK_NOT_IN_FLIGHT` code.
+- Subscribers compete for the lowest READY offset and are constrained by their configured in-flight cap.
+- `requeueExpired()` scans in-flight deliveries manually; no timer thread, scheduler, or `DelayQueue` exists yet.
+- Network handling and persistence remain deliberately unbuilt.
