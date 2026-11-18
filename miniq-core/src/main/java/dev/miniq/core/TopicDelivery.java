@@ -111,7 +111,11 @@ public final class TopicDelivery {
         Objects.requireNonNull(subscriberId, "subscriberId must not be null");
         lock.lock();
         try {
-            Subscriber subscriber = requireSubscriber(subscriberId);
+            // A disconnect race is expected: a released or not-yet-registered subscriber must not crash the caller.
+            Subscriber subscriber = subscribers.get(subscriberId);
+            if (subscriber == null) {
+                return Optional.empty();
+            }
             if (subscriber.inFlightOffsets.size() >= subscriber.maxInFlight || readyOffsets.isEmpty()) {
                 return Optional.empty();
             }
@@ -148,11 +152,11 @@ public final class TopicDelivery {
             if (current == null) {
                 return AckResult.NOT_IN_FLIGHT;
             }
-            if (current.deliveryCount != deliveryCount) {
-                return AckResult.STALE_DELIVERY;
-            }
             if (!current.subscriberId.equals(subscriberId)) {
                 return AckResult.NOT_IN_FLIGHT;
+            }
+            if (current.deliveryCount != deliveryCount) {
+                return AckResult.STALE_DELIVERY;
             }
             if (!current.deadline.isAfter(clock.instant())) {
                 return AckResult.NOT_IN_FLIGHT;
@@ -234,14 +238,6 @@ public final class TopicDelivery {
         } finally {
             lock.unlock();
         }
-    }
-
-    private Subscriber requireSubscriber(String subscriberId) {
-        Subscriber subscriber = subscribers.get(subscriberId);
-        if (subscriber == null) {
-            throw new IllegalStateException("subscriber is not registered: " + subscriberId);
-        }
-        return subscriber;
     }
 
     private static void requireInvariant(boolean condition, String message) {

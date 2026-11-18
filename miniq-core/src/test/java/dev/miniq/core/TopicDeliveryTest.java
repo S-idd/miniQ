@@ -187,6 +187,80 @@ class TopicDeliveryTest {
     }
 
     @Test
+    void lateAckAfterReleaseIsSideEffectFreeAndMessageIsRedelivered() {
+        MutableClock clock = new MutableClock(START);
+        TopicDelivery delivery = newDelivery(clock);
+        delivery.register("old-consumer", 500, 16);
+        delivery.register("new-consumer", 500, 16);
+        Message message = delivery.publish("released");
+        Delivery first = delivery.deliverNext("old-consumer").orElseThrow();
+        delivery.checkInvariants();
+
+        delivery.release("old-consumer");
+        delivery.checkInvariants();
+        assertThat(delivery.ack("old-consumer", message.offset(), first.deliveryCount()))
+                .isEqualTo(AckResult.NOT_IN_FLIGHT);
+        delivery.checkInvariants();
+
+        Delivery redelivery = delivery.deliverNext("new-consumer").orElseThrow();
+        assertThat(redelivery.message()).isEqualTo(message);
+        assertThat(redelivery.deliveryCount()).isEqualTo(2);
+        delivery.checkInvariants();
+        assertThat(delivery.ack("new-consumer", message.offset(), redelivery.deliveryCount()))
+                .isEqualTo(AckResult.ACKED);
+        delivery.checkInvariants();
+    }
+
+    @Test
+    void releasedSubscriberCannotRequestAnotherDelivery() {
+        MutableClock clock = new MutableClock(START);
+        TopicDelivery delivery = newDelivery(clock);
+        delivery.register("released-consumer", 500, 16);
+        delivery.publish("pending");
+        delivery.release("released-consumer");
+        delivery.checkInvariants();
+
+        assertThat(delivery.deliverNext("released-consumer")).isEmpty();
+        delivery.checkInvariants();
+    }
+
+    @Test
+    void anotherSubscriberCannotAckOwnersDelivery() {
+        MutableClock clock = new MutableClock(START);
+        TopicDelivery delivery = newDelivery(clock);
+        delivery.register("owner", 500, 16);
+        delivery.register("other", 500, 16);
+        Message message = delivery.publish("owned");
+        Delivery active = delivery.deliverNext("owner").orElseThrow();
+        delivery.checkInvariants();
+
+        assertThat(delivery.ack("other", message.offset(), active.deliveryCount()))
+                .isEqualTo(AckResult.NOT_IN_FLIGHT);
+        delivery.checkInvariants();
+        assertThat(delivery.ack("owner", message.offset(), active.deliveryCount()))
+                .isEqualTo(AckResult.ACKED);
+        delivery.checkInvariants();
+    }
+
+    @Test
+    void wrongSubscriberWithWrongDeliveryCountReturnsNotInFlight() {
+        MutableClock clock = new MutableClock(START);
+        TopicDelivery delivery = newDelivery(clock);
+        delivery.register("owner", 500, 16);
+        delivery.register("other", 500, 16);
+        Message message = delivery.publish("owned");
+        Delivery active = delivery.deliverNext("owner").orElseThrow();
+        delivery.checkInvariants();
+
+        assertThat(delivery.ack("other", message.offset(), active.deliveryCount() + 1))
+                .isEqualTo(AckResult.NOT_IN_FLIGHT);
+        delivery.checkInvariants();
+        assertThat(delivery.ack("owner", message.offset(), active.deliveryCount()))
+                .isEqualTo(AckResult.ACKED);
+        delivery.checkInvariants();
+    }
+
+    @Test
     void twoSubscribersCannotHoldTheSameMessageAtOnce() {
         MutableClock clock = new MutableClock(START);
         TopicDelivery delivery = newDelivery(clock);

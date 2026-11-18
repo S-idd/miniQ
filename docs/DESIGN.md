@@ -34,6 +34,8 @@ Every transition and trigger:
 
 ACKED is terminal: a message is never put back into READY. An ACK checks the current time from the injected `Clock` against that attempt’s deadline while holding the topic lock. If the deadline has arrived, it rejects the ACK without changing state; `requeueExpired()` performs the IN_FLIGHT to READY transition. Otherwise a matching ACK can transition the message to ACKED. A later attempt has a higher delivery count.
 
+ACK checks follow this order: unknown offset returns `UNKNOWN_OFFSET`; an offset that is not IN_FLIGHT returns `NOT_IN_FLIGHT`; an IN_FLIGHT message owned by another subscriber returns `NOT_IN_FLIGHT`; a wrong delivery count for the owner returns `STALE_DELIVERY`; and an expired deadline returns `NOT_IN_FLIGHT`. Rejected ACKs do not change state.
+
 ## Offsets and log mapping
 
 Each topic starts at offset 0 and receives monotonically increasing offsets in publish-acceptance order. An offset is assigned only when a publish is accepted and is never reused after assignment. A failed pre-commit append does not consume an offset or return one to the client; a complete log record recovered after an ambiguous crash still reserves its recorded offset. Different topics have independent sequences. In memory, each topic owns its next-offset counter and an ordered message collection.
@@ -52,7 +54,11 @@ The default ack timeout is 5,000 ms. A subscriber may choose 100–300,000 ms wh
 
 A shared `DelayQueue` holds deadline entries `(topic, offset, deliveryCount, deadline)`. One daemon timeout thread blocks on the queue's next deadline, then checks the message's current state and delivery count under its topic lock. Old entries left behind by ACK or disconnect are stale and ignored. This avoids scanning every in-flight message on every timer tick.
 
+The topic lock is never held while waiting on the timeout queue, and the queue is never locked while waiting on a topic lock.
+
 Each topic has a `ReentrantLock` protecting its offset counter, ordered messages, subscriber membership/selection, state transitions, ownership, and in-flight counts. Publish, dispatch selection, ACK, disconnect cleanup, and timeout expiry take that lock. Message payloads and assigned offsets are immutable after publish. The network server uses separate connection reader tasks and a bounded writer queue per connection; it never writes a socket while holding a core topic lock. Delivery enqueue failure is treated as a disconnect, returning that connection's deliveries to READY. This design favors straightforward invariants over lock-free coordination.
+
+`deliverNext(subscriberId)` returns empty if the subscriber is unknown, including after release. A disconnect can race with dispatch, so a late delivery request from a released connection is expected and must not throw.
 
 Core invariants:
 
