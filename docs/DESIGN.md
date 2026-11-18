@@ -155,4 +155,26 @@ None currently.
 - Subscriptions remain inactive until `startDelivery()`; the server writes the SUBSCRIBE `OK` reply before activating the subscription, preserving response-before-MSG ordering.
 - The core facade allows one active subscription per connection as specified by the protocol; ACK without one returns `NOT_IN_FLIGHT` at this API boundary.
 - Delivery sinks are invoked serially per connection, from publisher, handler, or timeout threads; they enqueue to the shared outbound queue and must not block.
-- Sockets, protocol parsing, and persistence remain unbuilt.
+- In-process chaos and stress tests exercise consumer release, timeout redelivery, and concurrent publish/ACK paths; `Broker.stats()` provides immutable aggregate and per-topic state counts.
+- Sockets, protocol parsing, and persistence remain unbuilt; miniq-core is frozen for v0.1 except bug fixes.
+
+## Core API summary
+
+### Public methods
+
+- `Broker(Clock, BrokerConfig)` creates the in-memory facade. `start()` starts its one shared timeout worker; `close()` releases subscriptions and stops that worker.
+- `publish(topic, payload)` validates and appends a message, then pumps available deliveries. `subscribe(connectionId, topic, [ackTimeoutMs], sink)` registers one inactive subscription; `startDelivery(connectionId)` activates it after the server writes `OK`.
+- `ack(connectionId, topic, offset, deliveryCount)` acknowledges the current attempt. `disconnect(connectionId)` releases its in-flight messages. `stats()` returns aggregate and per-topic counts.
+- `Topic` exposes append-only publish, lookup, size, and next-offset accessors. `TopicDelivery` exposes registration, release, publish, delivery, ACK, and expiry operations; `TimeoutScheduler` exposes registration, start, and close.
+
+### Threading rules
+
+Core state is safe for concurrent callers. Each topic delivery state is guarded by its own lock, and the append-only Topic log has its own lock. Broker sinks and deadline listeners run outside those locks; a sink is serialized per connection but may run on publisher, handler, or timeout threads. The timeout worker is one daemon thread shared by all topics.
+
+### Guarantees
+
+Offsets are gapless and monotonic per topic. Competing subscribers hold at most one current attempt per message; matching ACKs are terminal, while disconnect or timeout makes an unacked message READY for redelivery. Delivery is at-least-once, so duplicates are allowed and redelivery can reorder observations. Stats are immutable per-topic snapshots; topics are captured independently, so the aggregate is not a global atomic snapshot during concurrent changes.
+
+### Known limitations
+
+The broker is single-process and in-memory; restart loses messages and ACK state. There is no networking, protocol parser, persistence, auth, UI, or consumer groups. A slow sink can stall the caller thread that invokes it; server sinks must enqueue quickly to a separate outbound writer. Delivery and ACK bookkeeping grows with the number of published offsets for the life of the process.

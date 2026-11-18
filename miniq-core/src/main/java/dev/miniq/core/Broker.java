@@ -3,8 +3,10 @@ package dev.miniq.core;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -126,6 +128,25 @@ public final class Broker implements AutoCloseable {
         if (subscription != null) {
             pumpTopic(subscription.delivery);
         }
+    }
+
+    /** Returns an immutable per-topic stats snapshot; concurrent topics are captured independently. */
+    public BrokerStats stats() {
+        Map<String, BrokerStats.TopicStats> perTopic = new TreeMap<>();
+        deliveriesByTopic.forEach((topicName, delivery) -> perTopic.put(topicName, delivery.statsSnapshot()));
+        long published = 0;
+        long ready = 0;
+        long inFlight = 0;
+        long acked = 0;
+        long redeliveries = 0;
+        for (BrokerStats.TopicStats topicStats : perTopic.values()) {
+            published += topicStats.published();
+            ready += topicStats.ready();
+            inFlight += topicStats.inFlight();
+            acked += topicStats.acked();
+            redeliveries += topicStats.redeliveries();
+        }
+        return new BrokerStats(published, ready, inFlight, acked, redeliveries, perTopic);
     }
 
     @Override

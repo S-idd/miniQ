@@ -96,7 +96,8 @@ public final class TimeoutScheduler implements DeadlineListener, AutoCloseable {
     int drainDue() {
         int requeued = 0;
         DeadlineEntry entry;
-        while ((entry = deadlines.poll()) != null) {
+        while ((entry = deadlines.peek()) != null && entry.getDelay(TimeUnit.NANOSECONDS) <= 0) {
+            deadlines.poll();
             if (process(entry)) {
                 requeued++;
             }

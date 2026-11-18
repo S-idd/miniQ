@@ -6,7 +6,7 @@
 - [x] Day 4: In-memory delivery states, subscriber registration, ACK handling, manual expiry, and Day 4 hardening
 - [x] Day 5: Shared timeout scheduler, automatic expiry, and listener-failure hardening
 - [x] Day 6: In-memory broker facade and push delivery, including Day 6 hardening and bounded pump retries
-- [ ] Day 7: In-memory delivery core
+- [x] Day 7: In-memory delivery core verified with in-process chaos simulation, stress coverage, broker stats, and review fixes; miniq-core frozen for v0.1 except bug fixes
 - [ ] Days 8–10: TCP server and client
 - [ ] Days 11–12: Checkpoint, Chaos Stage A, tag v0.1
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2

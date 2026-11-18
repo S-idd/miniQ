@@ -131,6 +131,27 @@ class TimeoutSchedulerTest {
     }
 
     @Test
+    void drainingBeforeDeadlinePreservesEntryForLaterExpiry() {
+        MutableClock clock = new MutableClock(START);
+        try (TimeoutScheduler scheduler = new TimeoutScheduler(clock)) {
+            TopicDelivery delivery = newDelivery(clock, scheduler);
+            scheduler.register(delivery);
+            delivery.register("consumer", 100, 16);
+            delivery.publish("pending");
+            Delivery first = delivery.deliverNext("consumer").orElseThrow();
+
+            assertThat(scheduler.drainDue()).isZero();
+            clock.advance(Duration.ofMillis(100));
+            assertThat(scheduler.drainDue()).isEqualTo(1);
+            delivery.checkInvariants();
+            Delivery second = delivery.deliverNext("consumer").orElseThrow();
+            assertThat(second.message()).isEqualTo(first.message());
+            assertThat(second.deliveryCount()).isEqualTo(2);
+            delivery.checkInvariants();
+        }
+    }
+
+    @Test
     void realTimeoutRequeuesAndRedeliversWithoutManualSweep() {
         Clock clock = Clock.systemUTC();
         try (TimeoutScheduler scheduler = new TimeoutScheduler(clock)) {

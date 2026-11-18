@@ -301,6 +301,50 @@ class BrokerTest {
     }
 
     @Test
+    void statsSnapshotReportsTotalsPerTopicAndRedeliveries() {
+        try (Broker broker = new Broker(new MutableClock(START), new BrokerConfig(5_000, 1, 65_536))) {
+            broker.publish("orders", "one");
+            broker.publish("invoices", "two");
+            List<Delivery> firstOrder = new ArrayList<>();
+            broker.subscribe("first-order", "orders", firstOrder::add);
+            broker.startDelivery("first-order");
+            BrokerStats beforeRelease = broker.stats();
+            assertThat(beforeRelease.published()).isEqualTo(2);
+            assertThat(beforeRelease.ready()).isEqualTo(1);
+            assertThat(beforeRelease.inFlight()).isEqualTo(1);
+            assertThat(beforeRelease.acked()).isZero();
+            assertThat(beforeRelease.redeliveries()).isZero();
+
+            broker.disconnect("first-order");
+            List<Delivery> redelivery = new ArrayList<>();
+            broker.subscribe("replacement-order", "orders", redelivery::add);
+            broker.startDelivery("replacement-order");
+            assertThat(redelivery).hasSize(1);
+            assertThat(redelivery.getFirst().deliveryCount()).isEqualTo(2);
+            assertThat(broker.ack("replacement-order", "orders", 0, 2)).isEqualTo(AckResult.ACKED);
+
+            List<Delivery> invoice = new ArrayList<>();
+            broker.subscribe("invoice-consumer", "invoices", invoice::add);
+            broker.startDelivery("invoice-consumer");
+            assertThat(broker.ack("invoice-consumer", "invoices", 0, 1)).isEqualTo(AckResult.ACKED);
+
+            BrokerStats complete = broker.stats();
+            assertThat(complete.published()).isEqualTo(2);
+            assertThat(complete.ready()).isZero();
+            assertThat(complete.inFlight()).isZero();
+            assertThat(complete.acked()).isEqualTo(2);
+            assertThat(complete.redeliveries()).isEqualTo(1);
+            assertThat(complete.perTopic()).containsOnlyKeys("invoices", "orders");
+            assertThat(complete.perTopic().get("orders"))
+                    .isEqualTo(new BrokerStats.TopicStats(1, 0, 0, 1, 1));
+            assertThat(complete.perTopic().get("invoices"))
+                    .isEqualTo(new BrokerStats.TopicStats(1, 0, 0, 1, 0));
+            assertThatThrownBy(() -> complete.perTopic().clear()).isInstanceOf(UnsupportedOperationException.class);
+            broker.checkInvariants();
+        }
+    }
+
+    @Test
     void oneConnectionCannotSubscribeTwiceAndAckWithoutSubscriptionIsNotInFlight() {
         MutableClock clock = new MutableClock(START);
         try (Broker broker = new Broker(clock, new BrokerConfig())) {

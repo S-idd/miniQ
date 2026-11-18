@@ -31,6 +31,7 @@ public final class TopicDelivery {
     private final Set<Long> ackedOffsets = new HashSet<>();
     private final Map<Long, Integer> deliveryCounts = new HashMap<>();
     private final Map<String, Subscriber> subscribers = new HashMap<>();
+    private long redeliveries;
 
     /**
      * The delivery layer owns publishing to {@code topic} after construction.
@@ -136,6 +137,9 @@ public final class TopicDelivery {
 
             readyOffsets.remove(offset);
             deliveryCounts.put(offset, deliveryCount);
+            if (deliveryCount > 1) {
+                redeliveries = Math.incrementExact(redeliveries);
+            }
             inFlightByOffset.put(offset, new InFlight(subscriberId, deliveryCount, deadline));
             subscriber.inFlightOffsets.add(offset);
             delivery = new Delivery(message, deliveryCount, deadline);
@@ -280,6 +284,16 @@ public final class TopicDelivery {
 
     String topicName() {
         return topic.name();
+    }
+
+    BrokerStats.TopicStats statsSnapshot() {
+        lock.lock();
+        try {
+            return new BrokerStats.TopicStats(
+                    topic.size(), readyOffsets.size(), inFlightByOffset.size(), ackedOffsets.size(), redeliveries);
+        } finally {
+            lock.unlock();
+        }
     }
 
     RuntimeException lastDeadlineListenerFailure() {
