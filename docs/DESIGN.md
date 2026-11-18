@@ -32,7 +32,7 @@ Every transition and trigger:
 | IN_FLIGHT | READY | The attempt's ack deadline is reached before a matching ACK is accepted. |
 | IN_FLIGHT | READY | The owning consumer connection disconnects or is declared closed, whichever occurs first relative to timeout. |
 
-ACKED is terminal: a message is never put back into READY. An ACK checks the current time from the injected `Clock` against that attempt’s deadline while holding the topic lock. If the deadline has arrived, it rejects the ACK without changing state; `requeueExpired()` performs the IN_FLIGHT to READY transition. Otherwise a matching ACK can transition the message to ACKED. A later attempt has a higher delivery count.
+ACKED is terminal: a message is never put back into READY. An ACK checks the current time from the injected `Clock` against that attempt’s deadline while holding the topic lock. If the deadline has arrived, it rejects the ACK without changing state; `expireAttempt()` performs the matching IN_FLIGHT to READY transition, while `requeueExpired()` remains a manual sweep for tests. Otherwise a matching ACK can transition the message to ACKED. A later attempt has a higher delivery count.
 
 ACK checks follow this order: unknown offset returns `UNKNOWN_OFFSET`; an offset that is not IN_FLIGHT returns `NOT_IN_FLIGHT`; an IN_FLIGHT message owned by another subscriber returns `NOT_IN_FLIGHT`; a wrong delivery count for the owner returns `STALE_DELIVERY`; and an expired deadline returns `NOT_IN_FLIGHT`. Rejected ACKs do not change state.
 
@@ -52,13 +52,21 @@ Delivery is at-least-once, not exactly-once. Before ACK, timeout or disconnect c
 
 The default ack timeout is 5,000 ms. A subscriber may choose 100–300,000 ms when subscribing; the value applies to each delivery made to that subscription. Tests and chaos runs override it to approximately 500 ms. The timeout begins when the broker marks a message IN_FLIGHT for delivery, not when the client finishes processing it. If the connection disconnects first, the message returns to READY immediately; otherwise timeout returns it to READY when the deadline is reached.
 
-A shared `DelayQueue` holds deadline entries `(topic, offset, deliveryCount, deadline)`. One daemon timeout thread blocks on the queue's next deadline, then checks the message's current state and delivery count under its topic lock. Old entries left behind by ACK or disconnect are stale and ignored. This avoids scanning every in-flight message on every timer tick.
+A shared `DelayQueue` holds deadline entries `(topic, offset, deliveryCount, deadline)`. One daemon timeout thread blocks on the queue's next deadline, then checks the message's current state and delivery count under its topic lock through `expireAttempt()`. Old entries left behind by ACK, disconnect, or a newer attempt are stale and ignored. This avoids scanning every in-flight message on every timer tick.
 
 The topic lock is never held while waiting on the timeout queue, and the queue is never locked while waiting on a topic lock.
+
+There is a small window after `deliverNext()` commits IN_FLIGHT and before its listener adds the deadline entry. The listener is called outside the topic lock, so an ACK or disconnect may make the eventual queue entry stale; `expireAttempt()` ignores such entries. If the listener throws before enqueueing, `TopicDelivery` records the exception and still returns the delivery, which remains IN_FLIGHT. The caller can recover it with `requeueExpired()` after its deadline, or release the subscriber to return it to READY immediately. A periodic 30-second sweep is not built because it would reintroduce a full scan; that backstop remains a future idea.
 
 Each topic has a `ReentrantLock` protecting its offset counter, ordered messages, subscriber membership/selection, state transitions, ownership, and in-flight counts. Publish, dispatch selection, ACK, disconnect cleanup, and timeout expiry take that lock. Message payloads and assigned offsets are immutable after publish. The network server uses separate connection reader tasks and a bounded writer queue per connection; it never writes a socket while holding a core topic lock. Delivery enqueue failure is treated as a disconnect, returning that connection's deliveries to READY. This design favors straightforward invariants over lock-free coordination.
 
 `deliverNext(subscriberId)` returns empty if the subscriber is unknown, including after release. A disconnect can race with dispatch, so a late delivery request from a released connection is expected and must not throw.
+
+`DeliverySink.deliver` is never called concurrently for one connection, but it runs on arbitrary threads (publisher, handler, or the miniq-timeout thread). Sinks must not block: they enqueue to the connection's outbound queue, and a separate writer drains it. Replies (OK/ERR) and MSG lines share that queue so they cannot interleave.
+
+The Day 8 server flow is `subscribe` -> write `OK` -> `startDelivery`, so no MSG can be enqueued before the SUBSCRIBE reply. `subscribe()` registers an inactive subscription; `startDelivery(connectionId)` activates it and pumps backlog. A disconnected or unknown connection is a no-op for `startDelivery()`.
+
+`Broker.ack` throws `IllegalArgumentException` for an invalid topic name; the server parser must validate names first.
 
 Core invariants:
 
@@ -92,6 +100,8 @@ Use one `ReentrantLock` per topic for state changes and dispatch choice. Reject 
 ### Deadline scheduling
 Use one shared `DelayQueue` and timeout thread with stale-attempt checks. Reject periodic full scans because their cost grows with all in-flight messages and expiry latency depends on the scan interval.
 
+The scheduler resolves entries through a concurrent map keyed by topic name; registration rejects a second, different delivery object for the same topic. `TopicDelivery` reports deadlines through a small listener after releasing its lock, so delivery state never waits on the timeout queue while holding the topic lock.
+
 ### In-flight bound
 Limit each subscription to 16 unacknowledged messages by default. Reject unbounded push because a slow consumer could accumulate unlimited outstanding work and memory use.
 
@@ -122,3 +132,27 @@ None currently.
 - Subscribers compete for the lowest READY offset and are constrained by their configured in-flight cap.
 - `requeueExpired()` scans in-flight deliveries manually; no timer thread, scheduler, or `DelayQueue` exists yet.
 - Network handling and persistence remain deliberately unbuilt.
+
+## Implementation notes (Day 5)
+
+- `TopicDelivery.expireAttempt()` requeues only the matching in-flight delivery count once its deadline has arrived; `requeueExpired()` remains available as a manual sweep.
+- One shared `TimeoutScheduler` owns a `DelayQueue` and one daemon thread named `miniq-timeout` for all registered topics.
+- The scheduler resolves queue entries through a concurrent map keyed by topic name; duplicate topic registration with a different delivery object is rejected.
+- `deliverNext()` reports each new deadline to a small listener after releasing the topic lock; listener exceptions are recorded and do not suppress the delivery result.
+- The IN_FLIGHT-to-queue handoff has a small window; a failed notification can be recovered by manual `requeueExpired()` or subscriber release.
+- Only the timeout thread and callers touch `TopicDelivery`, and every state access is protected by that delivery's topic lock.
+- The topic lock is never held while waiting on the timeout queue, and the queue is never locked while waiting on a topic lock.
+- Networking, a broker facade, and persistence are not built.
+
+## Implementation notes (Day 6)
+
+- `Broker` owns a `TopicRegistry`, one `TopicDelivery` per topic, and one shared `TimeoutScheduler` started by `start()` and stopped by `close()`.
+- `BrokerConfig` holds the default ACK timeout, maximum in-flight count, and maximum line size; topics are created on first publish or subscribe.
+- A per-topic work-in-progress pump drains READY messages after publish, ACK, disconnect release, or timeout requeue; delivery sinks run outside `TopicDelivery` locks. Runtime failures are logged and contained, while an `Error` resets the work counter before it is rethrown.
+- If a pump pass throws a `RuntimeException`, the same pump call retries up to three consecutive failures, resetting the count after a successful pass, then logs and stops retrying.
+- The pump uses round-robin subscriber selection among eligible connections, as allowed by the competing-consumer design.
+- A sink exception disconnects that connection, releases its in-flight work, and lets the pump offer those messages to another subscriber.
+- Subscriptions remain inactive until `startDelivery()`; the server writes the SUBSCRIBE `OK` reply before activating the subscription, preserving response-before-MSG ordering.
+- The core facade allows one active subscription per connection as specified by the protocol; ACK without one returns `NOT_IN_FLIGHT` at this API boundary.
+- Delivery sinks are invoked serially per connection, from publisher, handler, or timeout threads; they enqueue to the shared outbound queue and must not block.
+- Sockets, protocol parsing, and persistence remain unbuilt.
