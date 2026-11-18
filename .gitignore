@@ -1,0 +1,19 @@
+# Maven
+**/target/
+*.class
+
+# Java
+*.jar
+*.war
+hs_err_pid*
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# Local broker data
+data/
