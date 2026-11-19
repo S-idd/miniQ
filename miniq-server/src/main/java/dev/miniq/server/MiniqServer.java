@@ -1,8 +1,85 @@
 package dev.miniq.server;
 
-/** Minimal Day 1 placeholder for the miniq-server module. */
-public final class MiniqServer {
-    public String status() {
-        return "placeholder";
+import dev.miniq.core.Broker;
+import dev.miniq.core.BrokerConfig;
+
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/** Single-node TCP server for the MiniQ line protocol. The Broker lifecycle remains caller-owned. */
+public final class MiniqServer implements AutoCloseable {
+    private final Broker broker;
+    private final BrokerConfig config;
+    private final int requestedPort;
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final Set<ClientConnection> connections = ConcurrentHashMap.newKeySet();
+    private volatile ServerSocket serverSocket;
+    private volatile Thread acceptThread;
+
+    /** Retained for source compatibility with the original module placeholder. */
+    public MiniqServer() {
+        broker = null;
+        config = null;
+        requestedPort = -1;
+    }
+
+    public MiniqServer(Broker broker, BrokerConfig config, int port) {
+        if (port < 0 || port > 65535) throw new IllegalArgumentException("port must be between 0 and 65535");
+        this.broker = java.util.Objects.requireNonNull(broker, "broker must not be null");
+        this.config = java.util.Objects.requireNonNull(config, "config must not be null");
+        requestedPort = port;
+    }
+
+    /** Legacy placeholder accessor retained so existing clients can migrate independently. */
+    public String status() { return "placeholder"; }
+
+    public synchronized void start() throws IOException {
+        if (broker == null) throw new IllegalStateException("server requires Broker and BrokerConfig");
+        if (closed.get()) throw new IllegalStateException("server is closed");
+        if (serverSocket != null) throw new IllegalStateException("server already started");
+        ServerSocket listener = new ServerSocket(requestedPort);
+        serverSocket = listener;
+        acceptThread = Thread.ofPlatform().name("miniq-accept-" + listener.getLocalPort()).daemon(true)
+                .start(() -> acceptLoop(listener));
+    }
+
+    public int port() {
+        ServerSocket listener = serverSocket;
+        if (listener == null) throw new IllegalStateException("server has not started");
+        return listener.getLocalPort();
+    }
+
+    private void acceptLoop(ServerSocket listener) {
+        while (!closed.get()) {
+            try {
+                Socket socket = listener.accept();
+                String connectionId = UUID.randomUUID().toString();
+                ClientConnection connection = new ClientConnection(broker, config, connectionId, socket,
+                        () -> connections.removeIf(candidate -> candidate.connectionId().equals(connectionId)));
+                connections.add(connection);
+                connection.start();
+            } catch (IOException failure) {
+                if (!closed.get()) close();
+                return;
+            }
+        }
+    }
+
+    @Override public void close() {
+        if (!closed.compareAndSet(false, true)) return;
+        ServerSocket listener = serverSocket;
+        if (listener != null) {
+            try { listener.close(); } catch (IOException ignored) { }
+        }
+        for (ClientConnection connection : connections.toArray(ClientConnection[]::new)) connection.close();
+        Thread acceptor = acceptThread;
+        if (acceptor != null && acceptor != Thread.currentThread()) {
+            try { acceptor.join(2_000); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        }
     }
 }

@@ -158,6 +158,23 @@ None currently.
 - In-process chaos and stress tests exercise consumer release, timeout redelivery, and concurrent publish/ACK paths; `Broker.stats()` provides immutable aggregate and per-topic state counts.
 - Sockets, protocol parsing, and persistence remain unbuilt; miniq-core is frozen for v0.1 except bug fixes.
 
+## Implementation notes (Day 8a)
+
+- `miniq-server` now depends on `miniq-core` through the parent-managed dependency version.
+- Immutable command records and `ProtocolParser` implement the documented PUBLISH, SUBSCRIBE, and ACK line grammar, including UTF-8 byte limits and core topic validation.
+- `ResponseFormatter` builds protocol response lines and maps core ACK and subscription results to their documented wire responses.
+- Networking, sockets, and calls to `Broker` are deliberately not built in this step.
+- The parser and the broker must use the same max line length; the server constructs the parser from `BrokerConfig.maxLineBytes()`. The handler still catches `IllegalArgumentException` from `Broker.publish` and replies `ERR`.
+
+## Implementation notes (Day 8b)
+
+- `MiniqServer` owns a platform accept thread and starts one virtual reader thread and one virtual writer thread per accepted connection; it does not start or close the caller-owned `Broker`.
+- The reader accumulates at most `BrokerConfig.maxLineBytes()` bytes per LF-framed request, validates UTF-8 strictly, and closes after reporting `LINE_TOO_LONG` or `INVALID_UTF8`; an incomplete frame at EOF is discarded.
+- Each connection has one bounded outbound queue of 1,024 protocol lines shared by command replies and pushed `MSG` lines. One virtual writer serializes complete UTF-8 lines to the socket.
+- A delivery sink only enqueues a formatted `MSG`. A full queue or closed connection makes the sink throw; core disconnect handling releases in-flight work for redelivery.
+- EOF, socket errors, writer failure, explicit server close, and enqueue failure converge on one atomic disconnect guard, which closes the socket and calls `Broker.disconnect(connectionId)` once.
+- A successful SUBSCRIBE enqueues its response before calling `Broker.startDelivery`, preserving response-before-backlog delivery. PUBLISH and ACK remain available on a subscribed connection.
+
 ## Core API summary
 
 ### Public methods
