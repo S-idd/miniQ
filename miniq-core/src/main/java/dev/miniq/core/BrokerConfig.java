@@ -4,7 +4,7 @@ package dev.miniq.core;
 public record BrokerConfig(long defaultAckTimeoutMs, int maxInFlight, int maxLineBytes) {
     public static final long DEFAULT_ACK_TIMEOUT_MS = 5_000;
     public static final int DEFAULT_MAX_IN_FLIGHT = 16;
-    public static final int DEFAULT_MAX_LINE_BYTES = 65_536;
+    public static final int DEFAULT_MAX_LINE_BYTES = Topic.DEFAULT_MAX_LINE_BYTES;
 
     public BrokerConfig() {
         this(DEFAULT_ACK_TIMEOUT_MS, DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_LINE_BYTES);
