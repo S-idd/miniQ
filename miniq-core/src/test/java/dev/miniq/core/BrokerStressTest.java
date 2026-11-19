@@ -77,13 +77,17 @@ class BrokerStressTest {
             }
 
             assertThat(ackedOffsets)
+                    .as("all %d offsets must finish ACKED exactly once", MESSAGE_COUNT)
+                    .hasSize(MESSAGE_COUNT)
                     .containsExactlyInAnyOrderElementsOf(LongStream.range(0, MESSAGE_COUNT).boxed().toList());
             BrokerStats stats = broker.stats();
             assertThat(stats.published()).isEqualTo(MESSAGE_COUNT);
             assertThat(stats.ready()).isZero();
             assertThat(stats.inFlight()).isZero();
             assertThat(stats.acked()).isEqualTo(MESSAGE_COUNT);
-            assertThat(stats.redeliveries()).isPositive();
+            assertThat(stats.redeliveries())
+                    .as("skipped ACKs must expire and be redelivered")
+                    .isGreaterThan(0);
             broker.checkInvariants();
         } finally {
             start.countDown();
