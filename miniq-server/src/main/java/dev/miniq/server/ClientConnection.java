@@ -66,11 +66,8 @@ final class ClientConnection implements AutoCloseable {
                 Line line = readLine(input, config.maxLineBytes());
                 if (line == null) break;
                 if (line.tooLong) {
-                    enqueue(ResponseFormatter.err(ProtocolErrorCode.LINE_TOO_LONG,
+                    closeAfterError(ResponseFormatter.err(ProtocolErrorCode.LINE_TOO_LONG,
                             "maximum line size is " + config.maxLineBytes() + " bytes"));
-                    outbound.put(STOP);
-                    Thread currentWriter = writer;
-                    if (currentWriter != null) currentWriter.join();
                     return;
                 }
                 if (!line.complete) break; // An incomplete frame at EOF is discarded per protocol.
@@ -80,13 +77,13 @@ final class ClientConnection implements AutoCloseable {
                             .onUnmappableCharacter(CodingErrorAction.REPORT)
                             .decode(ByteBuffer.wrap(line.bytes)).toString();
                 } catch (CharacterCodingException invalid) {
-                    enqueue(ResponseFormatter.err(ProtocolErrorCode.INVALID_UTF8, "line is not valid UTF-8 text"));
+                    closeAfterError(ResponseFormatter.err(
+                            ProtocolErrorCode.INVALID_UTF8, "line is not valid UTF-8 text"));
                     return;
                 }
                 handle(parser, text);
             }
-        } catch (IOException | InterruptedException failure) {
-            if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+        } catch (IOException failure) {
         } finally {
             close();
         }
@@ -132,12 +129,35 @@ final class ClientConnection implements AutoCloseable {
                     enqueue(ResponseFormatter.ack(broker.ack(connectionId, ack.topic(), ack.offset(), ack.deliveryCount())));
                 }
             }
-        } catch (IllegalArgumentException | IllegalStateException failure) {
+        } catch (IllegalArgumentException failure) {
             enqueue(ResponseFormatter.err(ProtocolErrorCode.SERVER_ERROR,
                     failure.getMessage() == null ? "broker rejected command" : failure.getMessage()));
+        } catch (IllegalStateException failure) {
+            enqueue(ResponseFormatter.err(ProtocolErrorCode.SERVER_ERROR, "broker unavailable"));
         } catch (RuntimeException failure) {
             enqueue(ResponseFormatter.err(ProtocolErrorCode.SERVER_ERROR, "unexpected broker failure"));
         }
+    }
+
+    /** Queues a terminal protocol error without blocking, then gives the writer a bounded drain window. */
+    private void closeAfterError(String errLine) {
+        if (!outbound.offer(errLine)) {
+            shutdown();
+            return;
+        }
+        if (!outbound.offer(STOP)) {
+            shutdown();
+            return;
+        }
+        Thread currentWriter = writer;
+        if (currentWriter != null && currentWriter != Thread.currentThread()) {
+            try {
+                currentWriter.join(2_000);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        shutdown();
     }
 
     private void deliver(Delivery delivery) {

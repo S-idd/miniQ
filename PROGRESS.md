@@ -9,7 +9,7 @@
 - [x] Day 7: In-memory delivery core verified with in-process chaos simulation, stress coverage, broker stats, and review fixes; miniq-core frozen for v0.1 except bug fixes
 - [x] Day 8a: Pure Java server command model, protocol parser, response formatter, and parser tests; max-line configuration cleanup
 - [x] Core refactor: single line-limit constant
-- [x] Day 8b: TCP server, virtual-thread connection handling, bounded serialized outbound path, and socket integration coverage; shutdown hardening for queue-full and concurrent disconnect paths
+- [x] Day 8b: TCP server, virtual-thread connection handling, bounded serialized outbound path, socket integration coverage, and terminal-error close hardening
 - [ ] Days 8c–10: TCP client and remaining integration
 - [ ] Days 11–12: Checkpoint, Chaos Stage A, tag v0.1
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
