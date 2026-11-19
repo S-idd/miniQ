@@ -10,7 +10,8 @@
 - [x] Day 8a: Pure Java server command model, protocol parser, response formatter, and parser tests; max-line configuration cleanup
 - [x] Core refactor: single line-limit constant
 - [x] Day 8b: TCP server, virtual-thread connection handling, bounded serialized outbound path, socket integration coverage, and terminal-error close hardening
-- [ ] Days 8c–10: TCP client and remaining integration
+- [x] Day 9: Plain-JDK TCP client, FIFO request/reply handling, bounded virtual-thread message dispatcher, auto-ACK support, and socket integration coverage
+- [ ] Day 10: Remaining integration and client/server hardening
 - [ ] Days 11–12: Checkpoint, Chaos Stage A, tag v0.1
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
 - [ ] Days 18–21: Spring Boot starter and demo apps
