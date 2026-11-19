@@ -5,3 +5,4 @@
 - Consider a low-frequency `requeueExpired()` backstop sweep for missed deadline notifications; not built because periodic full scans conflict with the DelayQueue design.
 - Optional per-subscriber delivery executor so a slow sink can never stall the timeout thread.
 - Idle connection timeout for silent clients.
+- Client write timeout (a blocked socket write holds the write lock).

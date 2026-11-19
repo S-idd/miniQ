@@ -181,7 +181,7 @@ None currently.
 
 - `miniq-client` uses only JDK APIs in main code; core and server are test-scoped dependencies for real socket integration tests. The former Day 1 placeholder test and class were removed to permit the specified `MiniQClient` name on case-insensitive filesystems.
 - One virtual reader resolves replies from a FIFO registered under the same write lock as socket writes. A separate virtual dispatcher invokes handlers from a bounded 1,024-message queue, so slow handlers do not delay replies; queue overflow closes the socket and lets the server release in-flight messages.
-- Reader frames are bounded to 65,536 bytes; client requests are serialized, request/reply waits time out after five seconds by default, and connection shutdown fails every pending request. `autoAck` sends ACK on the dispatcher thread after successful handler return and logs false or failed ACK outcomes.
+- Reader frames are bounded to 65,536 bytes; client requests are serialized, request/reply waits time out after five seconds by default, and connection shutdown fails every pending request. `autoAck` registers and writes ACK on the dispatcher thread, then handles its reply asynchronously so delayed ACK responses do not stall message dispatch; false or failed outcomes are logged.
 
 ## Core API summary
 

@@ -6,7 +6,10 @@ import dev.miniq.server.MiniqServer;
 import org.junit.jupiter.api.Test;
 
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -23,6 +26,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -39,10 +43,12 @@ class MiniQClientIntegrationTest {
             assertThat(producer.publish("events", "third")).isEqualTo(2);
             assertThat(producer.publish("unicode", "spaces stay  snow 雪 ☃")).isZero();
 
+            long publishedBeforeInvalidInputs = running.broker.stats().published();
             assertThatThrownBy(() -> producer.publish("events", "bad\nline"))
                     .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("CR or LF");
             assertThatThrownBy(() -> producer.publish("bad topic", "x"))
                     .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("topic");
+            assertThat(running.broker.stats().published()).isEqualTo(publishedBeforeInvalidInputs);
         }
     }
 
@@ -164,6 +170,55 @@ class MiniQClientIntegrationTest {
     }
 
     @Test
+    void serverCloseFailsPendingRequestAndLaterCalls() throws Exception {
+        try (Running running = new Running(new BrokerConfig());
+             CloseOnServerShutdownProxy proxy = new CloseOnServerShutdownProxy(running.server.port());
+             MiniQClient client = MiniQClient.connect("127.0.0.1", proxy.port(), 1_000)) {
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                Future<Long> pending = executor.submit(() -> client.publish("pending", "waiting"));
+                assertThat(proxy.pendingRequest.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
+                running.server.close();
+                assertThatThrownBy(() -> pending.get(WAIT_SECONDS, TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class).hasCauseInstanceOf(MiniQException.class);
+                assertThatThrownBy(() -> client.publish("later", "fails"))
+                        .isInstanceOf(MiniQException.class);
+            } finally {
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    @Test
+    void replyTimeoutClosesConnectionAndLaterCallCannotUseLateReply() throws Exception {
+        try (ServerSocket silentServer = new ServerSocket(0)) {
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try (MiniQClient client = MiniQClient.connect("127.0.0.1", silentServer.getLocalPort(), 1_000, 150)) {
+                Future<Socket> accepted = executor.submit(silentServer::accept);
+                try (Socket peer = accepted.get(WAIT_SECONDS, TimeUnit.SECONDS)) {
+                    peer.setSoTimeout(2_000);
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(peer.getInputStream(), StandardCharsets.UTF_8));
+                    ExecutorService requestExecutor = Executors.newSingleThreadExecutor();
+                    try {
+                        Future<Long> first = requestExecutor.submit(() -> client.publish("timeout", "first"));
+                        assertThat(reader.readLine()).isEqualTo("PUBLISH timeout first");
+                        assertThatThrownBy(() -> first.get(2, TimeUnit.SECONDS))
+                                .isInstanceOf(ExecutionException.class)
+                                .hasCauseInstanceOf(MiniQException.class)
+                                .cause().hasMessageContaining("timed out");
+                        assertThatThrownBy(() -> client.publish("timeout", "later"))
+                                .isInstanceOf(MiniQException.class).hasMessageContaining("timed out");
+                    } finally {
+                        requestExecutor.shutdownNow();
+                    }
+                }
+            } finally {
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    @Test
     void dispatcherQueueOverflowClosesClientAndReturnsInFlightWork() throws Exception {
         try (Running running = new Running(new BrokerConfig(5_000, 16, 65_536));
              MiniQClient consumer = running.client(5_000, 1);
@@ -188,6 +243,27 @@ class MiniQClientIntegrationTest {
                 assertThat(message.deliveryCount()).isGreaterThanOrEqualTo(2);
             }
             assertThatThrownBy(() -> consumer.publish("overflow", "closed")).isInstanceOf(MiniQException.class);
+        }
+    }
+
+    @Test
+    void autoAckDispatchesTwoHundredMessagesWithoutWaitingForAckReplies() throws Exception {
+        BrokerConfig config = new BrokerConfig(5_000, 256, 65_536);
+        try (Running running = new Running(config); MiniQClient producer = running.client()) {
+            for (int i = 0; i < 200; i++) producer.publish("bulk-auto", "message-" + i);
+            try (AckReplyGate gate = new AckReplyGate(running.server.port(), 200);
+                 MiniQClient consumer = MiniQClient.connect("127.0.0.1", gate.port(), 1_000,
+                         5_000, 256)) {
+                CountDownLatch handled = new CountDownLatch(200);
+                consumer.subscribe("bulk-auto", 5_000, message -> handled.countDown(), true);
+                assertThat(gate.allAckRequests.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
+                assertThat(handled.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
+                awaitCondition(() -> running.broker.stats().acked() == 200
+                        && running.broker.stats().inFlight() == 0);
+                assertThat(running.broker.stats().ready()).isZero();
+                assertThat(running.broker.stats().redeliveries()).isZero();
+                assertThat(gate.repliesReleased.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
+            }
         }
     }
 
@@ -238,6 +314,153 @@ class MiniQClientIntegrationTest {
         @Override public void close() {
             server.close();
             broker.close();
+        }
+    }
+
+    /** Delays every ACK reply until all expected ACK requests have reached the real server. */
+    private static final class AckReplyGate implements AutoCloseable {
+        private final ServerSocket listener;
+        private final int expectedAcks;
+        private final CountDownLatch allAckRequests;
+        private final CountDownLatch repliesReleased = new CountDownLatch(1);
+        private final Object outputLock = new Object();
+        private final List<String> heldReplies = new ArrayList<>();
+        private final AtomicBoolean subscribeReplyForwarded = new AtomicBoolean();
+        private volatile Socket clientSocket;
+        private volatile Socket serverSocket;
+
+        private AckReplyGate(int serverPort, int expectedAcks) throws IOException {
+            this.expectedAcks = expectedAcks;
+            allAckRequests = new CountDownLatch(expectedAcks);
+            listener = new ServerSocket(0);
+            Thread.ofVirtual().start(() -> relay(serverPort));
+        }
+
+        private int port() { return listener.getLocalPort(); }
+
+        private void relay(int serverPort) {
+            try (Socket downstream = listener.accept();
+                 Socket upstream = new Socket("127.0.0.1", serverPort)) {
+                clientSocket = downstream;
+                serverSocket = upstream;
+                Thread.ofVirtual().start(() -> forwardRequests(downstream, upstream));
+                forwardReplies(upstream, downstream);
+            } catch (IOException ignored) {
+            } finally {
+                closeSockets();
+            }
+        }
+
+        private void forwardRequests(Socket downstream, Socket upstream) {
+            try {
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        downstream.getInputStream(), StandardCharsets.UTF_8));
+                BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
+                        upstream.getOutputStream(), StandardCharsets.UTF_8));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    writer.write(line);
+                    writer.write('\n');
+                    writer.flush();
+                    if (line.startsWith("ACK ")) {
+                        allAckRequests.countDown();
+                        synchronized (outputLock) { releaseRepliesIfReady(downstream); }
+                    }
+                }
+            } catch (IOException ignored) {
+            }
+        }
+
+        private void forwardReplies(Socket upstream, Socket downstream) {
+            try {
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        upstream.getInputStream(), StandardCharsets.UTF_8));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    synchronized (outputLock) {
+                        if (!subscribeReplyForwarded.get()) {
+                            writeDownstream(downstream, line);
+                            if (line.equals("OK")) subscribeReplyForwarded.set(true);
+                        } else if (line.startsWith("MSG ")) {
+                            writeDownstream(downstream, line);
+                        } else {
+                            heldReplies.add(line);
+                            releaseRepliesIfReady(downstream);
+                        }
+                    }
+                }
+            } catch (IOException ignored) {
+            }
+        }
+
+        private void releaseRepliesIfReady(Socket downstream) throws IOException {
+            if (allAckRequests.getCount() != 0 || heldReplies.size() < expectedAcks) return;
+            for (String reply : heldReplies) writeDownstream(downstream, reply);
+            heldReplies.clear();
+            repliesReleased.countDown();
+        }
+
+        private void writeDownstream(Socket downstream, String line) throws IOException {
+            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
+                    downstream.getOutputStream(), StandardCharsets.UTF_8));
+            writer.write(line);
+            writer.write('\n');
+            writer.flush();
+        }
+
+        private void closeSockets() {
+            try { if (clientSocket != null) clientSocket.close(); } catch (IOException ignored) { }
+            try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) { }
+        }
+
+        @Override public void close() {
+            try { listener.close(); } catch (IOException ignored) { }
+            closeSockets();
+        }
+    }
+
+    /** Holds a client's request while observing the real MiniqServer socket closure. */
+    private static final class CloseOnServerShutdownProxy implements AutoCloseable {
+        private final ServerSocket listener;
+        private final CountDownLatch pendingRequest = new CountDownLatch(1);
+        private volatile Socket clientSocket;
+        private volatile Socket serverSocket;
+
+        private CloseOnServerShutdownProxy(int serverPort) throws IOException {
+            listener = new ServerSocket(0);
+            Thread.ofVirtual().start(() -> relay(serverPort));
+        }
+
+        private int port() { return listener.getLocalPort(); }
+
+        private void relay(int serverPort) {
+            try (Socket downstream = listener.accept();
+                 Socket upstream = new Socket("127.0.0.1", serverPort)) {
+                clientSocket = downstream;
+                serverSocket = upstream;
+                Thread.ofVirtual().start(() -> {
+                    try {
+                        BufferedReader reader = new BufferedReader(new InputStreamReader(
+                                downstream.getInputStream(), StandardCharsets.UTF_8));
+                        if (reader.readLine() != null) pendingRequest.countDown();
+                    } catch (IOException ignored) { }
+                });
+                upstream.getInputStream().read();
+                downstream.close();
+            } catch (IOException ignored) {
+            } finally {
+                closeSockets();
+            }
+        }
+
+        private void closeSockets() {
+            try { if (clientSocket != null) clientSocket.close(); } catch (IOException ignored) { }
+            try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) { }
+        }
+
+        @Override public void close() {
+            try { listener.close(); } catch (IOException ignored) { }
+            closeSockets();
         }
     }
 }

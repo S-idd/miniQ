@@ -155,6 +155,26 @@ public final class MiniQClient implements AutoCloseable {
     @Override public void close() { shutdown(new MiniQException("client is closed")); }
 
     private String request(String line) {
+        Pending item = enqueueRequest(line);
+        try { return item.result.get(replyTimeoutMs, TimeUnit.MILLISECONDS); }
+        catch (TimeoutException timeout) {
+            MiniQException wrapped = new MiniQException("timed out waiting for MiniQ server reply", timeout);
+            shutdown(wrapped);
+            throw wrapped;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            MiniQException wrapped = new MiniQException("interrupted waiting for MiniQ server reply", interrupted);
+            shutdown(wrapped);
+            throw wrapped;
+        } catch (ExecutionException failed) {
+            Throwable cause = failed.getCause();
+            if (cause instanceof MiniQException clientFailure) throw clientFailure;
+            throw new MiniQException("MiniQ request failed", cause);
+        }
+    }
+
+    /** Registers before writing, while holding the lock that defines wire order. */
+    private Pending enqueueRequest(String line) {
         Pending item = new Pending();
         synchronized (writeLock) {
             ensureOpen();
@@ -174,21 +194,7 @@ public final class MiniQClient implements AutoCloseable {
                 }
             }
         }
-        try { return item.result.get(replyTimeoutMs, TimeUnit.MILLISECONDS); }
-        catch (TimeoutException timeout) {
-            MiniQException wrapped = new MiniQException("timed out waiting for MiniQ server reply", timeout);
-            shutdown(wrapped);
-            throw wrapped;
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            MiniQException wrapped = new MiniQException("interrupted waiting for MiniQ server reply", interrupted);
-            shutdown(wrapped);
-            throw wrapped;
-        } catch (ExecutionException failed) {
-            Throwable cause = failed.getCause();
-            if (cause instanceof MiniQException clientFailure) throw clientFailure;
-            throw new MiniQException("MiniQ request failed", cause);
-        }
+        return item;
     }
 
     private void readLoop() {
@@ -286,13 +292,39 @@ public final class MiniQClient implements AutoCloseable {
                 try { current.onMessage(message); succeeded = true; }
                 catch (Throwable failure) { LOG.log(Level.WARNING, "message handler failed; message left unacked", failure); }
                 if (succeeded && autoAck) {
-                    try { if (!ack(message)) LOG.warning("autoAck returned false for " + message.topic() + " offset " + message.offset()); }
-                    catch (RuntimeException failure) { LOG.log(Level.WARNING, "autoAck failed", failure); }
+                    sendAutoAck(message);
                 }
             }
         } catch (InterruptedException interrupted) {
             if (!closed.get()) shutdown(new MiniQException("message dispatcher stopped unexpectedly", interrupted));
         }
+    }
+
+    /** Sends an ACK in dispatcher order and observes its result without blocking message dispatch. */
+    private void sendAutoAck(Message message) {
+        final Pending item;
+        try {
+            item = enqueueRequest("ACK " + message.topic() + " " + message.offset() + " " + message.deliveryCount());
+        } catch (RuntimeException failure) {
+            LOG.log(Level.WARNING, "autoAck could not be sent for " + message.topic()
+                    + " offset " + message.offset(), failure);
+            return;
+        }
+        item.result.whenComplete((reply, failure) -> {
+            String description = message.topic() + " offset " + message.offset();
+            if (failure != null) {
+                Throwable cause = failure instanceof ExecutionException && failure.getCause() != null
+                        ? failure.getCause() : failure;
+                if (cause instanceof MiniQException protocolFailure
+                        && protocolFailure.errorCode().filter("ACK_NOT_IN_FLIGHT"::equals).isPresent()) {
+                    LOG.warning("autoAck returned false for " + description);
+                } else {
+                    LOG.log(Level.WARNING, "autoAck failed for " + description, cause);
+                }
+            } else if (!"OK".equals(reply)) {
+                LOG.warning("autoAck returned unexpected reply for " + description + ": " + reply);
+            }
+        });
     }
 
     private void shutdown(MiniQException failure) {
