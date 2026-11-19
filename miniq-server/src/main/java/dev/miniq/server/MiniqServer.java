@@ -21,13 +21,6 @@ public final class MiniqServer implements AutoCloseable {
     private volatile ServerSocket serverSocket;
     private volatile Thread acceptThread;
 
-    /** Retained for source compatibility with the original module placeholder. */
-    public MiniqServer() {
-        broker = null;
-        config = null;
-        requestedPort = -1;
-    }
-
     public MiniqServer(Broker broker, BrokerConfig config, int port) {
         if (port < 0 || port > 65535) throw new IllegalArgumentException("port must be between 0 and 65535");
         this.broker = java.util.Objects.requireNonNull(broker, "broker must not be null");
@@ -35,11 +28,7 @@ public final class MiniqServer implements AutoCloseable {
         requestedPort = port;
     }
 
-    /** Legacy placeholder accessor retained so existing clients can migrate independently. */
-    public String status() { return "placeholder"; }
-
     public synchronized void start() throws IOException {
-        if (broker == null) throw new IllegalStateException("server requires Broker and BrokerConfig");
         if (closed.get()) throw new IllegalStateException("server is closed");
         if (serverSocket != null) throw new IllegalStateException("server already started");
         ServerSocket listener = new ServerSocket(requestedPort);
@@ -62,7 +51,8 @@ public final class MiniqServer implements AutoCloseable {
                 ClientConnection connection = new ClientConnection(broker, config, connectionId, socket,
                         () -> connections.removeIf(candidate -> candidate.connectionId().equals(connectionId)));
                 connections.add(connection);
-                connection.start();
+                if (closed.get()) connection.close();
+                else connection.start();
             } catch (IOException failure) {
                 if (!closed.get()) close();
                 return;

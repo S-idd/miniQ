@@ -172,7 +172,8 @@ None currently.
 - The reader accumulates at most `BrokerConfig.maxLineBytes()` bytes per LF-framed request, validates UTF-8 strictly, and closes after reporting `LINE_TOO_LONG` or `INVALID_UTF8`; an incomplete frame at EOF is discarded.
 - Each connection has one bounded outbound queue of 1,024 protocol lines shared by command replies and pushed `MSG` lines. One virtual writer serializes complete UTF-8 lines to the socket.
 - A delivery sink only enqueues a formatted `MSG`. A full queue or closed connection makes the sink throw; core disconnect handling releases in-flight work for redelivery.
-- EOF, socket errors, writer failure, explicit server close, and enqueue failure converge on one atomic disconnect guard, which closes the socket and calls `Broker.disconnect(connectionId)` once.
+- EOF, socket errors, writer failure, explicit server close, and enqueue failure converge on one shutdown method. Separate atomic flags guard socket/writer closure and the connection's single `Broker.disconnect(connectionId)` call, so sink failure cannot suppress broker release after marking the socket closed.
+- The connection makes its own guarded broker disconnect call even when a delivery sink throws; correctness does not rely on the broker pump's additional idempotent cleanup after observing that exception.
 - A successful SUBSCRIBE enqueues its response before calling `Broker.startDelivery`, preserving response-before-backlog delivery. PUBLISH and ACK remain available on a subscribed connection.
 
 ## Core API summary

@@ -31,14 +31,15 @@ import dev.miniq.server.protocol.SubscribeCommand;
 /** Owns one client socket, its reader, and its single serialized outbound writer. */
 final class ClientConnection implements AutoCloseable {
     private static final int OUTBOUND_CAPACITY = 1_024;
-    private static final String STOP = new String("\u0000MINIQ_STOP\u0000"); // this lie needs to checked  
+    private static final String STOP = new String("\u0000MINIQ_STOP\u0000");
     private final Broker broker;
     private final BrokerConfig config;
     private final String connectionId;
     private final Socket socket;
     private final Runnable onClosed;
     private final BlockingQueue<String> outbound = new ArrayBlockingQueue<>(OUTBOUND_CAPACITY);
-    private final AtomicBoolean disconnected = new AtomicBoolean();
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean brokerDisconnectCalled = new AtomicBoolean();
     private final AtomicBoolean subscribed = new AtomicBoolean();
     private volatile Thread reader;
     private volatile Thread writer;
@@ -61,7 +62,7 @@ final class ClientConnection implements AutoCloseable {
     private void readLoop() {
         ProtocolParser parser = new ProtocolParser(config.maxLineBytes());
         try (BufferedInputStream input = new BufferedInputStream(socket.getInputStream())) {
-            while (!disconnected.get()) {
+            while (!closed.get()) {
                 Line line = readLine(input, config.maxLineBytes());
                 if (line == null) break;
                 if (line.tooLong) {
@@ -141,23 +142,14 @@ final class ClientConnection implements AutoCloseable {
 
     private void deliver(Delivery delivery) {
         String formatted = ResponseFormatter.msg(delivery);
-        if (disconnected.get() || !outbound.offer(formatted)) {
-            closeAfterSinkFailure();
+        if (closed.get() || !outbound.offer(formatted)) {
+            shutdown();
             throw new IllegalStateException("connection outbound queue is full or closed");
         }
     }
 
-    /** The broker calls disconnect after it observes this sink exception. */
-    private void closeAfterSinkFailure() {
-        if (!disconnected.compareAndSet(false, true)) return;
-        try { socket.close(); } catch (IOException ignored) { }
-        Thread currentWriter = writer;
-        if (currentWriter != null && currentWriter != Thread.currentThread()) currentWriter.interrupt();
-        onClosed.run();
-    }
-
     private void enqueue(String line) {
-        if (disconnected.get() || !outbound.offer(line)) close();
+        if (closed.get() || !outbound.offer(line)) shutdown();
     }
 
     private void writeLoop() {
@@ -171,17 +163,24 @@ final class ClientConnection implements AutoCloseable {
             }
         } catch (IOException | InterruptedException failure) {
             if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
-            close();
+        } finally {
+            shutdown();
         }
     }
 
-    @Override public void close() {
-        if (!disconnected.compareAndSet(false, true)) return;
-        try { socket.close(); } catch (IOException ignored) { }
-        Thread currentWriter = writer;
-        if (currentWriter != null && currentWriter != Thread.currentThread()) currentWriter.interrupt();
-        try { broker.disconnect(connectionId); } catch (RuntimeException ignored) { }
-        onClosed.run();
+    @Override public void close() { shutdown(); }
+
+    /** All shutdown triggers converge here; socket closure and broker release have independent guards. */
+    private void shutdown() {
+        if (closed.compareAndSet(false, true)) {
+            try { socket.close(); } catch (IOException ignored) { }
+            Thread currentWriter = writer;
+            if (currentWriter != null && currentWriter != Thread.currentThread()) currentWriter.interrupt();
+            try { onClosed.run(); } catch (RuntimeException ignored) { }
+        }
+        if (brokerDisconnectCalled.compareAndSet(false, true)) {
+            try { broker.disconnect(connectionId); } catch (RuntimeException ignored) { }
+        }
     }
 
     record Line(byte[] bytes, boolean complete, boolean tooLong) { }
