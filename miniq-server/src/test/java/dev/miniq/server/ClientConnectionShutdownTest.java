@@ -24,24 +24,43 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ClientConnectionShutdownTest {
     @Test
     void fullDeliveryQueueDisconnectsAndReturnsAttemptsForRedelivery() throws Exception {
-        BrokerConfig config = new BrokerConfig(5_000, 60_000, 65_536);
+        // BrokerConfig arguments are (default ACK timeout ms, max in-flight, max line bytes).
+        long ackTimeoutMs = 60_000;
+        int maxInFlight = 60_000;
+        int maxLineBytes = 65_536;
+        BrokerConfig config = new BrokerConfig(ackTimeoutMs, maxInFlight, maxLineBytes);
         try (Running running = new Running(config)) {
-            Peer slow = running.connect(1_024);
+            Socket slowSocket = new Socket();
+            slowSocket.setReceiveBufferSize(1_024);
+            slowSocket.connect(new InetSocketAddress("127.0.0.1", running.server.port()));
+            slowSocket.setSoTimeout(10_000);
+            Peer slow = new Peer(slowSocket);
             slow.write("SUBSCRIBE backpressure");
             assertThat(slow.read()).isEqualTo("OK");
 
-            String payload = "x".repeat(60_000);
+            int messageCount = 2_048;
+            int payloadBytes = 32 * 1_024;
+            // 64 MiB total exceeds the 1,024-line queue (~32 MiB) plus loopback socket buffers.
+            String payload = "x".repeat(payloadBytes);
             try (Peer publisher = running.connect()) {
-                for (int i = 0; i < 1_100; i++) {
-                    publisher.write("PUBLISH backpressure " + payload);
-                    assertThat(publisher.read()).startsWith("OK ");
+                int batchSize = 128;
+                for (int start = 0; start < messageCount; start += batchSize) {
+                    int batchEnd = Math.min(start + batchSize, messageCount);
+                    for (int i = start; i < batchEnd; i++) {
+                        publisher.writeBuffered("PUBLISH backpressure " + payload);
+                    }
+                    publisher.flush();
+                    for (int i = start; i < batchEnd; i++) {
+                        assertThat(publisher.read()).startsWith("OK ");
+                    }
                 }
             }
 
-            BrokerStats.TopicStats afterSinkFailure = running.broker.stats().perTopic().get("backpressure");
-            assertThat(afterSinkFailure.published()).isEqualTo(1_100);
+            BrokerStats.TopicStats afterSinkFailure = awaitSlowClientDisconnect(
+                    running.broker, "backpressure", messageCount);
+            assertThat(afterSinkFailure.published()).isEqualTo(messageCount);
             assertThat(afterSinkFailure.inFlight()).isZero();
-            assertThat(afterSinkFailure.ready()).isEqualTo(1_100);
+            assertThat(afterSinkFailure.ready()).isEqualTo(messageCount);
 
             try (Peer second = running.connect()) {
                 ExecutorService responseReader = Executors.newSingleThreadExecutor();
@@ -51,14 +70,20 @@ class ClientConnectionShutdownTest {
                     second.write("SUBSCRIBE backpressure");
                     String[] lines = firstDelivery.get(10, TimeUnit.SECONDS);
                     assertThat(lines[0]).isEqualTo("OK");
-                    assertThat(lines[1]).startsWith("MSG backpressure 0 2 ");
+                    String[] fields = lines[1].split(" ", 5);
+                    assertThat(fields).hasSize(5);
+                    assertThat(fields[0]).isEqualTo("MSG");
+                    assertThat(fields[1]).isEqualTo("backpressure");
+                    assertThat(fields[2]).isEqualTo("0");
+                    int deliveryCount = Integer.parseInt(fields[3]);
+                    assertThat(deliveryCount).isEqualTo(2);
                 } finally {
                     responseReader.shutdownNow();
                 }
             }
             BrokerStats.TopicStats afterRedelivery = awaitTopic(running.broker, "backpressure", stats ->
-                    stats.ready() == 1_100 && stats.inFlight() == 0);
-            assertThat(afterRedelivery.ready()).isEqualTo(1_100);
+                    stats.ready() == messageCount && stats.inFlight() == 0);
+            assertThat(afterRedelivery.ready()).isEqualTo(messageCount);
             assertThat(afterRedelivery.inFlight()).isZero();
             slow.close();
         }
@@ -143,6 +168,21 @@ class ClientConnectionShutdownTest {
         throw new AssertionError("timed out waiting for broker state for topic " + topic + ": " + current);
     }
 
+    private static BrokerStats.TopicStats awaitSlowClientDisconnect(Broker broker, String topic,
+                                                                     int expectedPublished) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        BrokerStats.TopicStats current;
+        do {
+            current = broker.stats().perTopic().get(topic);
+            if (current != null && current.published() == expectedPublished
+                    && current.ready() == expectedPublished && current.inFlight() == 0) {
+                return current;
+            }
+            Thread.onSpinWait();
+        } while (System.nanoTime() < deadline);
+        throw new AssertionError("stalled client did not disconnect within 20 seconds; topic stats: " + current);
+    }
+
     private static void await(CountDownLatch latch) {
         try {
             if (!latch.await(10, TimeUnit.SECONDS)) throw new AssertionError("close gate timed out");
@@ -164,10 +204,16 @@ class ClientConnectionShutdownTest {
         }
 
         void write(String line) throws Exception {
+            writeBuffered(line);
+            flush();
+        }
+
+        void writeBuffered(String line) throws Exception {
             writer.write(line);
             writer.write('\n');
-            writer.flush();
         }
+
+        void flush() throws Exception { writer.flush(); }
 
         String read() throws Exception { return reader.readLine(); }
 

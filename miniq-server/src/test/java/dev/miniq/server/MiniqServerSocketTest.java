@@ -2,6 +2,7 @@ package dev.miniq.server;
 
 import dev.miniq.core.Broker;
 import dev.miniq.core.BrokerConfig;
+import dev.miniq.core.BrokerStats;
 import org.junit.jupiter.api.Test;
 
 import java.io.BufferedWriter;
@@ -16,6 +17,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -165,7 +167,11 @@ class MiniqServerSocketTest {
 
     @Test
     void slowConsumerIsDisconnectedWithoutBlockingPublishersOrOtherConsumers() throws Exception {
-        BrokerConfig config = new BrokerConfig(5_000, 1_200, 65_536);
+        // BrokerConfig arguments are (default ACK timeout ms, max in-flight, max line bytes).
+        long ackTimeoutMs = 60_000;
+        int maxInFlight = 60_000;
+        int maxLineBytes = 65_536;
+        BrokerConfig config = new BrokerConfig(ackTimeoutMs, maxInFlight, maxLineBytes);
         try (Running running = new Running(config)) {
             Socket slow = new Socket();
             slow.setReceiveBufferSize(1_024);
@@ -173,12 +179,31 @@ class MiniqServerSocketTest {
             slow.setSoTimeout(10_000);
             socketWrite(slow, "SUBSCRIBE slow");
             assertThat(read(slow)).isEqualTo("OK");
-            String payload = "x".repeat(60_000);
+            int messageCount = 2_048;
+            int payloadBytes = 32 * 1_024;
+            // 64 MiB total exceeds the 1,024-line queue (~32 MiB) plus loopback socket buffers.
+            String payload = "x".repeat(payloadBytes);
             try (Socket publisher = running.connect()) {
-                for (int i = 0; i < 1_100; i++) {
-                    socketWrite(publisher, "PUBLISH slow " + payload);
-                    assertThat(read(publisher)).startsWith("OK ");
+                BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
+                        publisher.getOutputStream(), StandardCharsets.UTF_8), 64 * 1_024);
+                int batchSize = 128;
+                for (int start = 0; start < messageCount; start += batchSize) {
+                    int batchEnd = Math.min(start + batchSize, messageCount);
+                    for (int i = start; i < batchEnd; i++) {
+                        writer.write("PUBLISH slow " + payload);
+                        writer.write('\n');
+                    }
+                    writer.flush();
+                    for (int i = start; i < batchEnd; i++) {
+                        assertThat(read(publisher)).startsWith("OK ");
+                    }
                 }
+            }
+            BrokerStats.TopicStats disconnected = awaitSlowClientDisconnect(
+                    running.broker, "slow", messageCount);
+            assertThat(disconnected.ready()).isEqualTo(messageCount);
+            assertThat(disconnected.inFlight()).isZero();
+            try (Socket publisher = running.connect()) {
                 socketWrite(publisher, "PUBLISH healthy still-working");
                 assertThat(read(publisher)).isEqualTo("OK 0");
             }
@@ -189,6 +214,21 @@ class MiniqServerSocketTest {
             }
             slow.close();
         }
+    }
+
+    private static BrokerStats.TopicStats awaitSlowClientDisconnect(Broker broker, String topic,
+                                                                     int expectedPublished) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        BrokerStats.TopicStats current;
+        do {
+            current = broker.stats().perTopic().get(topic);
+            if (current != null && current.published() == expectedPublished
+                    && current.ready() == expectedPublished && current.inFlight() == 0) {
+                return current;
+            }
+            Thread.onSpinWait();
+        } while (System.nanoTime() < deadline);
+        throw new AssertionError("stalled consumer did not disconnect within 20 seconds; topic stats: " + current);
     }
 
     @Test

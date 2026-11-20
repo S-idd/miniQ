@@ -6,3 +6,4 @@
 - Optional per-subscriber delivery executor so a slow sink can never stall the timeout thread.
 - Idle connection timeout for silent clients.
 - Client write timeout (a blocked socket write holds the write lock).
+- Outbound queue is bounded by line count (1,024), not bytes: a stalled connection can hold up to ~64 MiB. Bound by bytes.

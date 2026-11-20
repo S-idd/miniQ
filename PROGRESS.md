@@ -17,6 +17,7 @@
 - [x] Chaos Stage A passes; v0.1 ready to tag
 - [x] Day 12: README, CI and release workflows, and v0.1 documentation checkpoint; v0.1 remains ready to tag
 - [x] CI follow-up: hardened timing-sensitive delivery and process tests for slow runners; full reactor verification passes
+- [x] CI follow-up: deterministic socket backpressure coverage uses bounded ACK timing, small receive buffers, batched 64 MiB backlogs, and bounded disconnect polling; 10 Linux Docker runs pass
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
 - [ ] Days 18–21: Spring Boot starter and demo apps
 - [ ] Days 22–23: Benchmark and optional @EmbeddedMiniQ
