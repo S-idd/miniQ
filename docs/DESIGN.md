@@ -194,6 +194,7 @@ None currently.
 - `ChaosVerifier` counts complete log rows, distinct ids, missing expected ids, duplicate rows, and redelivery rows; it ignores a non-LF-terminated final row because a forced process exit can interrupt a write.
 - `ChaosStageAProcessTest` and `scripts/chaos-demo.sh` publish 1,000 ids, kill consumer A after at least 500 distinct logged ids, then start a fresh consumer B that appends to the same log. PASS requires complete id coverage; Stage A additionally requires observed redelivery.
 - The shaded `miniq-chaos.jar` includes the JDK-only client dependency and exposes `ChaosVerifyMain`; the viva script consumes prebuilt shaded JARs and never builds them itself.
+- TCP_NODELAY is enabled on every accepted server socket, and client requests plus server responses write each UTF-8 line and LF in one socket write to avoid Linux Nagle/delayed-ACK latency.
 
 ## Core API summary
 

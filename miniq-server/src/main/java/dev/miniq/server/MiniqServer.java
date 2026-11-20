@@ -47,6 +47,7 @@ public final class MiniqServer implements AutoCloseable {
         while (!closed.get()) {
             try {
                 Socket socket = listener.accept();
+                socket.setTcpNoDelay(true);
                 String connectionId = UUID.randomUUID().toString();
                 ClientConnection connection = new ClientConnection(broker, config, connectionId, socket,
                         () -> connections.removeIf(candidate -> candidate.connectionId().equals(connectionId)));

@@ -177,8 +177,8 @@ final class ClientConnection implements AutoCloseable {
             while (true) {
                 String line = outbound.take();
                 if (line == STOP) break;
-                output.write(line.getBytes(StandardCharsets.UTF_8));
-                output.write('\n');
+                byte[] frame = (line + "\n").getBytes(StandardCharsets.UTF_8);
+                output.write(frame);
                 output.flush();
             }
         } catch (IOException | InterruptedException failure) {

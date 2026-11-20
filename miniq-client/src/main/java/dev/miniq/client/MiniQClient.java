@@ -184,8 +184,8 @@ public final class MiniQClient implements AutoCloseable {
                 item.result.completeExceptionally(currentFailure());
             } else {
                 try {
-                    output.write(line.getBytes(StandardCharsets.UTF_8));
-                    output.write('\n');
+                    byte[] frame = (line + "\n").getBytes(StandardCharsets.UTF_8);
+                    output.write(frame);
                     output.flush();
                 } catch (IOException failure) {
                     MiniQException wrapped = new MiniQException("failed writing to MiniQ server", failure);
