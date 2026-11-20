@@ -12,7 +12,7 @@
 - [x] Day 8b: TCP server, virtual-thread connection handling, bounded serialized outbound path, socket integration coverage, and terminal-error close hardening
 - [x] Day 9: Plain-JDK TCP client, FIFO request/reply handling, bounded virtual-thread message dispatcher, auto-ACK support, and socket integration coverage
 - [x] Day 9 hardening: async auto-ACK completion, reply-timeout shutdown, expanded real-socket coverage
-- [ ] Day 10: Remaining integration and client/server hardening
+- [x] Day 10: Standalone shaded server JAR, process-based chaos publisher/consumer, and bounded separate-process smoke test; hardening removes per-message fsync and treats stale ACKs as expected
 - [ ] Days 11–12: Checkpoint, Chaos Stage A, tag v0.1
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
 - [ ] Days 18–21: Spring Boot starter and demo apps

@@ -183,6 +183,12 @@ None currently.
 - One virtual reader resolves replies from a FIFO registered under the same write lock as socket writes. A separate virtual dispatcher invokes handlers from a bounded 1,024-message queue, so slow handlers do not delay replies; queue overflow closes the socket and lets the server release in-flight messages.
 - Reader frames are bounded to 65,536 bytes; client requests are serialized, request/reply waits time out after five seconds by default, and connection shutdown fails every pending request. `autoAck` registers and writes ACK on the dispatcher thread, then handles its reply asynchronously so delayed ACK responses do not stall message dispatch; false or failed outcomes are logged.
 
+## Implementation notes (Day 10)
+
+- `MiniQServerMain` owns process startup, validates only the documented port, ACK timeout, and in-flight options, and reports the bound address with one stdout readiness line. Its shutdown hook closes the server before the caller-owned broker; the shaded `miniq-server.jar` includes core and selects this main class.
+- Chaos publisher and consumer mains depend on the client library; server/core are test-only dependencies in `miniq-chaos`. The consumer fsyncs `id deliveryCount` before optional processing delay and manual ACK so a forced process kill leaves a verifiable record of work received.
+- The Day 10 smoke acceptance test runs server, publisher, and consumer as child JVMs on the test classpath, checks all 200 ids with bounded waits, and forcibly cleans up children in `@AfterEach`. `scripts/chaos-demo.sh` runs the same no-crash smoke scenario; Stage A consumer-crash validation remains a later milestone.
+
 ## Core API summary
 
 ### Public methods

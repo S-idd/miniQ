@@ -23,3 +23,31 @@ Prove at-least-once delivery. No message lost; duplicates allowed.
 ## Script output
 
 The script prints clear step-by-step lines like "[3/10] Killing consumer (pid 4242) with SIGKILL..." and a final PASS/FAIL summary with counts.
+
+## Day 10 process smoke test (no crash)
+
+The automated `ChaosSmokeProcessTest` starts the server, publisher, and consumer as separate JVMs from the test classpath. It publishes 200 ids before subscribing, waits for the consumer's ready marker, then polls the consumer log until ids 1–200 are present. The test has bounded marker, process, and log waits and destroys all child JVMs in `@AfterEach`.
+
+Run the smoke scenario by hand from the repository root:
+
+```sh
+mvn -q clean package
+java -jar miniq-server/target/miniq-server.jar --port 0 --ack-timeout-ms 5000
+```
+
+Copy the port from `MINIQ_READY port=<port>`. In another terminal, publish the backlog:
+
+```sh
+CHAOS_CP="miniq-chaos/target/classes:miniq-client/target/classes"
+java -cp "$CHAOS_CP" dev.miniq.chaos.ChaosPublisherMain --host 127.0.0.1 --port <port> --topic orders --count 200
+```
+
+Then start the consumer (which writes each `id deliveryCount` row directly to the log before sleeping and ACKing):
+
+```sh
+java -cp "$CHAOS_CP" dev.miniq.chaos.ChaosConsumerMain --host 127.0.0.1 --port <port> --topic orders --log /tmp/miniq-received.log --ack-timeout-ms 500
+```
+
+After `CHAOS_CONSUMER_READY`, check that every id is present with `awk 'NF == 2 { seen[$1] = 1 } END { for (i = 1; i <= 200; i++) if (!seen[i]) exit 1 }' /tmp/miniq-received.log`. Stop the consumer and server processes after the check. The full Stage A kill-and-redeliver acceptance run remains the next chaos milestone.
+
+The consumer does not fsync each row. Stage A tests process termination with `SIGKILL`, which does not discard bytes already written to the operating system; fsync is needed for power loss, which Stage A does not test. Per-message fsync is slow enough to push ACKs past the 500 ms ACK timeout. If redelivery makes an ACK stale, the consumer reports `late ack for id X` to stderr and continues, as expected with at-least-once delivery.
