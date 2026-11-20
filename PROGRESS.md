@@ -19,6 +19,7 @@
 - [x] CI follow-up: hardened timing-sensitive delivery and process tests for slow runners; full reactor verification passes
 - [x] CI follow-up: deterministic socket backpressure coverage uses bounded ACK timing, small receive buffers, batched 64 MiB backlogs, and bounded disconnect polling; 10 Linux Docker runs pass
 - [x] TCP latency follow-up: confirmed ~42 ms Linux publish latency from Nagle/delayed-ACK interaction; enabled TCP_NODELAY on accepted sockets and switched both protocol writers to one-write line framing; three Linux Docker full-reactor verifications pass
+- [x] Test follow-up: concurrent consumers now retry stale/expired ACK attempts under sub-second real-clock timeouts; stress and chaos tests passed 50 local runs each, 50 each under four-process CPU load, and 20 each in one-CPU Docker
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
 - [ ] Days 18–21: Spring Boot starter and demo apps
 - [ ] Days 22–23: Benchmark and optional @EmbeddedMiniQ

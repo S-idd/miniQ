@@ -169,12 +169,15 @@ class BrokerChaosSimulationTest {
                 return;
             }
             AckResult result = broker.ack(connectionId, "orders", delivery.message().offset(), delivery.deliveryCount());
-            if (result == AckResult.ACKED) {
-                if (!ackedOffsets.add(delivery.message().offset())) {
-                    throw new AssertionError("offset ACKED more than once: " + delivery.message().offset());
+            switch (result) {
+                case ACKED -> {
+                    if (!ackedOffsets.add(delivery.message().offset())) {
+                        throw new AssertionError("offset ACKED more than once: " + delivery.message().offset());
+                    }
                 }
-            } else if (result == AckResult.UNKNOWN_OFFSET || result == AckResult.STALE_DELIVERY) {
-                throw new AssertionError("unexpected ACK result: " + result);
+                case STALE_DELIVERY, NOT_IN_FLIGHT -> { /* A timed-out attempt will be redelivered. */ }
+                case UNKNOWN_OFFSET -> throw new AssertionError(
+                        "unknown ACK offset " + delivery.message().offset());
             }
         }
     }

@@ -452,8 +452,14 @@ class BrokerTest {
             }
 
             AckResult result = broker.ack(currentConnection, "orders", offset, delivery.deliveryCount());
-            if (result != AckResult.ACKED || !acked.add(offset)) {
-                throw new AssertionError("unexpected ACK result or duplicate ACK: " + result);
+            switch (result) {
+                case ACKED -> {
+                    if (!acked.add(offset)) {
+                        throw new AssertionError("offset ACKED more than once: " + offset);
+                    }
+                }
+                case STALE_DELIVERY, NOT_IN_FLIGHT -> { /* A timed-out attempt will be redelivered. */ }
+                case UNKNOWN_OFFSET -> throw new AssertionError("unknown ACK offset: " + offset);
             }
         }
     }

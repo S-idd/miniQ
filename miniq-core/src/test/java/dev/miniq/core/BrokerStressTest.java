@@ -42,6 +42,7 @@ class BrokerStressTest {
         CountDownLatch start = new CountDownLatch(1);
         AtomicInteger publishersDone = new AtomicInteger();
         Set<Long> ackedOffsets = ConcurrentHashMap.newKeySet();
+        AckOutcomeCounts ackOutcomes = new AckOutcomeCounts();
         List<Future<?>> futures = new ArrayList<>();
         try {
             broker.start();
@@ -52,7 +53,8 @@ class BrokerStressTest {
                 broker.startDelivery(connectionId);
                 int consumerId = consumer;
                 futures.add(executor.submit(() -> consume(
-                        broker, connectionId, inbox, consumerId, ready, start, publishersDone, ackedOffsets)));
+                        broker, connectionId, inbox, consumerId, ready, start, publishersDone, ackedOffsets,
+                        ackOutcomes)));
             }
             for (int publisher = 0; publisher < PUBLISHERS; publisher++) {
                 int publisherId = publisher;
@@ -77,16 +79,16 @@ class BrokerStressTest {
             }
 
             assertThat(ackedOffsets)
-                    .as("all %d offsets must finish ACKED exactly once", MESSAGE_COUNT)
+                    .as("all %d offsets must finish ACKED exactly once; ACK outcomes: %s", MESSAGE_COUNT, ackOutcomes)
                     .hasSize(MESSAGE_COUNT)
                     .containsExactlyInAnyOrderElementsOf(LongStream.range(0, MESSAGE_COUNT).boxed().toList());
             BrokerStats stats = broker.stats();
-            assertThat(stats.published()).isEqualTo(MESSAGE_COUNT);
-            assertThat(stats.ready()).isZero();
-            assertThat(stats.inFlight()).isZero();
-            assertThat(stats.acked()).isEqualTo(MESSAGE_COUNT);
+            assertThat(stats.published()).as("ACK outcomes: %s", ackOutcomes).isEqualTo(MESSAGE_COUNT);
+            assertThat(stats.ready()).as("ACK outcomes: %s", ackOutcomes).isZero();
+            assertThat(stats.inFlight()).as("ACK outcomes: %s", ackOutcomes).isZero();
+            assertThat(stats.acked()).as("ACK outcomes: %s", ackOutcomes).isEqualTo(MESSAGE_COUNT);
             assertThat(stats.redeliveries())
-                    .as("skipped ACKs must expire and be redelivered")
+                    .as("skipped ACKs must expire and be redelivered; ACK outcomes: %s", ackOutcomes)
                     .isGreaterThan(0);
             broker.checkInvariants();
         } finally {
@@ -105,7 +107,8 @@ class BrokerStressTest {
             CountDownLatch ready,
             CountDownLatch start,
             AtomicInteger publishersDone,
-            Set<Long> ackedOffsets) {
+            Set<Long> ackedOffsets,
+            AckOutcomeCounts ackOutcomes) {
         Random random = new Random(0x4d696e6951L + consumerId);
         awaitStart(ready, start);
         while (publishersDone.get() < PUBLISHERS || ackedOffsets.size() < MESSAGE_COUNT) {
@@ -125,13 +128,39 @@ class BrokerStressTest {
             }
             AckResult result = broker.ack(
                     connectionId, "stress", delivery.message().offset(), delivery.deliveryCount());
-            if (result == AckResult.ACKED) {
-                if (!ackedOffsets.add(delivery.message().offset())) {
-                    throw new AssertionError("offset ACKED more than once: " + delivery.message().offset());
+            ackOutcomes.record(result);
+            switch (result) {
+                case ACKED -> {
+                    if (!ackedOffsets.add(delivery.message().offset())) {
+                        throw new AssertionError("offset ACKED more than once: " + delivery.message().offset()
+                                + "; ACK outcomes: " + ackOutcomes);
+                    }
                 }
-            } else if (result == AckResult.UNKNOWN_OFFSET || result == AckResult.STALE_DELIVERY) {
-                throw new AssertionError("unexpected ACK result: " + result);
+                case STALE_DELIVERY, NOT_IN_FLIGHT -> { /* A timed-out attempt will be redelivered. */ }
+                case UNKNOWN_OFFSET -> throw new AssertionError(
+                        "unknown ACK offset " + delivery.message().offset() + "; ACK outcomes: " + ackOutcomes);
             }
+        }
+    }
+
+    private static final class AckOutcomeCounts {
+        private final AtomicInteger acked = new AtomicInteger();
+        private final AtomicInteger staleDelivery = new AtomicInteger();
+        private final AtomicInteger notInFlight = new AtomicInteger();
+        private final AtomicInteger unknownOffset = new AtomicInteger();
+
+        void record(AckResult result) {
+            switch (result) {
+                case ACKED -> acked.incrementAndGet();
+                case STALE_DELIVERY -> staleDelivery.incrementAndGet();
+                case NOT_IN_FLIGHT -> notInFlight.incrementAndGet();
+                case UNKNOWN_OFFSET -> unknownOffset.incrementAndGet();
+            }
+        }
+
+        @Override public String toString() {
+            return "ACKED=" + acked.get() + ", STALE_DELIVERY=" + staleDelivery.get()
+                    + ", NOT_IN_FLIGHT=" + notInFlight.get() + ", UNKNOWN_OFFSET=" + unknownOffset.get();
         }
     }
 

@@ -222,8 +222,18 @@ class TimeoutSchedulerTest {
                                 if (!skipAck) {
                                     AckResult result = delivery.ack(subscriberId, attempt.message().offset(),
                                             attempt.deliveryCount());
-                                    if (result != AckResult.ACKED || !acked.add(attempt.message().offset())) {
-                                        throw new AssertionError("unexpected ACK result or duplicate ACK: " + result);
+                                    switch (result) {
+                                        case ACKED -> {
+                                            if (!acked.add(attempt.message().offset())) {
+                                                throw new AssertionError("offset ACKED more than once: "
+                                                        + attempt.message().offset());
+                                            }
+                                        }
+                                        case STALE_DELIVERY, NOT_IN_FLIGHT -> {
+                                            // The timeout worker will make this offset READY for another attempt.
+                                        }
+                                        case UNKNOWN_OFFSET -> throw new AssertionError(
+                                                "unknown ACK offset: " + attempt.message().offset());
                                     }
                                 }
                             } else {
