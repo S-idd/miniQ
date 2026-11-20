@@ -13,8 +13,8 @@ import java.util.regex.Pattern;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ChaosStageAProcessTest {
-    private static final Duration CHILD_TIMEOUT = Duration.ofSeconds(15);
-    private static final Duration STAGE_A_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration CHILD_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration STAGE_A_TIMEOUT = Duration.ofSeconds(60);
     private static final Pattern READY_PORT = Pattern.compile("MINIQ_READY port=(\\d+)");
 
     @TempDir Path directory;

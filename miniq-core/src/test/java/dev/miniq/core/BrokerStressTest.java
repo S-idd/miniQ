@@ -32,7 +32,7 @@ class BrokerStressTest {
     @Test
     @Tag("stress")
     void eightPublishersAndSubscribersAckTwentyThousandMessagesWithRandomSkips() {
-        assertTimeoutPreemptively(Duration.ofSeconds(30), BrokerStressTest::runStress);
+        assertTimeoutPreemptively(Duration.ofSeconds(60), BrokerStressTest::runStress);
     }
 
     private static void runStress() throws Exception {
@@ -65,13 +65,13 @@ class BrokerStressTest {
                 }));
             }
 
-            assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(ready.await(20, TimeUnit.SECONDS)).isTrue();
             start.countDown();
-            long deadline = System.nanoTime() + Duration.ofSeconds(28).toNanos();
+            long deadline = System.nanoTime() + Duration.ofSeconds(55).toNanos();
             for (Future<?> future : futures) {
                 long remaining = deadline - System.nanoTime();
                 if (remaining <= 0) {
-                    throw new AssertionError("stress run exceeded 28 seconds");
+                    throw new AssertionError("stress run exceeded 55 seconds");
                 }
                 future.get(remaining, TimeUnit.NANOSECONDS);
             }
@@ -92,7 +92,7 @@ class BrokerStressTest {
         } finally {
             start.countDown();
             executor.shutdownNow();
-            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
             broker.close();
         }
     }

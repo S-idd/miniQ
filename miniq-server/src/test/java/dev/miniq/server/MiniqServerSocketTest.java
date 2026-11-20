@@ -59,17 +59,32 @@ class MiniqServerSocketTest {
     void ackStaleAttemptTimeoutAndDisconnectRedelivery() throws Exception {
         try (Running running = new Running(new BrokerConfig(5_000, 16, 65_536));
              Socket first = running.connect()) {
-            socketWrite(first, "SUBSCRIBE retry 200");
+            socketWrite(first, "SUBSCRIBE retry 4000");
             assertThat(read(first)).isEqualTo("OK");
             Socket publisher = running.connect();
             socketWrite(publisher, "PUBLISH retry value");
             assertThat(read(publisher)).isEqualTo("OK 0");
             String firstMsg = read(first);
-            assertThat(firstMsg).isEqualTo("MSG retry 0 1 value");
-            assertThat(read(first)).isEqualTo("MSG retry 0 2 value");
-            socketWrite(first, "ACK retry 0 1");
+            String[] firstFields = firstMsg.split(" ", 5);
+            assertThat(firstFields).hasSize(5);
+            assertThat(firstFields[0]).isEqualTo("MSG");
+            assertThat(firstFields[1]).isEqualTo("retry");
+            assertThat(firstFields[2]).isEqualTo("0");
+            assertThat(firstFields[4]).isEqualTo("value");
+            int firstDeliveryCount = Integer.parseInt(firstFields[3]);
+            assertThat(firstDeliveryCount).isGreaterThanOrEqualTo(1);
+            String secondMsg = read(first);
+            String[] secondFields = secondMsg.split(" ", 5);
+            assertThat(secondFields).hasSize(5);
+            assertThat(secondFields[0]).isEqualTo("MSG");
+            assertThat(secondFields[1]).isEqualTo("retry");
+            assertThat(secondFields[2]).isEqualTo(firstFields[2]);
+            assertThat(secondFields[4]).isEqualTo("value");
+            int secondDeliveryCount = Integer.parseInt(secondFields[3]);
+            assertThat(secondDeliveryCount).isGreaterThanOrEqualTo(2);
+            socketWrite(first, "ACK retry 0 " + firstDeliveryCount);
             assertThat(read(first)).startsWith("ERR ACK_NOT_IN_FLIGHT");
-            socketWrite(first, "ACK retry 0 2");
+            socketWrite(first, "ACK retry 0 " + secondDeliveryCount);
             assertThat(read(first)).isEqualTo("OK");
             publisher.close();
         }

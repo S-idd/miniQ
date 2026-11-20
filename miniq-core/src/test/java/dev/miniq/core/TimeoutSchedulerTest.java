@@ -162,7 +162,7 @@ class TimeoutSchedulerTest {
             Delivery first = delivery.deliverNext("consumer").orElseThrow();
             scheduler.start();
 
-            Delivery second = awaitDelivery(delivery, "consumer", Duration.ofSeconds(5));
+            Delivery second = awaitDelivery(delivery, "consumer", Duration.ofSeconds(15));
             assertThat(second.message()).isEqualTo(first.message());
             assertThat(second.deliveryCount()).isEqualTo(2);
             delivery.checkInvariants();

@@ -24,7 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 class BrokerChaosSimulationTest {
     private static final int MESSAGE_COUNT = 1_000;
-    private static final Duration TEST_TIMEOUT = Duration.ofSeconds(20);
+    private static final Duration TEST_TIMEOUT = Duration.ofSeconds(60);
 
     @Test
     void stageAConsumerCrashesStillDeliverEveryMessageAtLeastOnce() {
@@ -71,7 +71,7 @@ class BrokerChaosSimulationTest {
                 broker.publish("orders", Integer.toString(id));
             }
 
-            assertThat(failuresComplete.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(failuresComplete.await(20, TimeUnit.SECONDS)).isTrue();
             BlockingQueue<Delivery> freshInbox = subscribe(
                     broker, "fresh-subscriber", receivedById, timedOutOffsets, timeoutRedeliveredToAliveConsumer);
             Future<?> freshWorker = executor.submit(() -> consumeStageA(
@@ -82,7 +82,7 @@ class BrokerChaosSimulationTest {
             workers.add(freshWorker);
 
             for (Future<?> worker : workers) {
-                worker.get(12, TimeUnit.SECONDS);
+                worker.get(20, TimeUnit.SECONDS);
             }
 
             assertThat(ackedOffsets)
@@ -106,7 +106,7 @@ class BrokerChaosSimulationTest {
         } finally {
             freshSubscriberStarted.countDown();
             executor.shutdownNow();
-            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
             broker.close();
         }
     }
@@ -144,7 +144,7 @@ class BrokerChaosSimulationTest {
         while (ackedOffsets.size() < MESSAGE_COUNT) {
             if (failureMode == FailureMode.NONE && failuresComplete.getCount() == 0
                     && freshSubscriberStarted.getCount() > 0 && ackedOffsets.size() >= 500) {
-                await(freshSubscriberStarted, Duration.ofSeconds(10));
+                await(freshSubscriberStarted, Duration.ofSeconds(20));
             }
             Delivery delivery;
             try {

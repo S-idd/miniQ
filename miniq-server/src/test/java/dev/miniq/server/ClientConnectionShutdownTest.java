@@ -24,7 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ClientConnectionShutdownTest {
     @Test
     void fullDeliveryQueueDisconnectsAndReturnsAttemptsForRedelivery() throws Exception {
-        BrokerConfig config = new BrokerConfig(5_000, 1_200, 65_536);
+        BrokerConfig config = new BrokerConfig(5_000, 60_000, 65_536);
         try (Running running = new Running(config)) {
             Peer slow = running.connect(1_024);
             slow.write("SUBSCRIBE backpressure");

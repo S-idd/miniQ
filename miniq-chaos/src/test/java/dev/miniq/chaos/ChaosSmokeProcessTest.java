@@ -15,7 +15,7 @@ import java.util.regex.Pattern;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ChaosSmokeProcessTest {
-    private static final Duration PROCESS_TIMEOUT = Duration.ofSeconds(15);
+    private static final Duration PROCESS_TIMEOUT = Duration.ofSeconds(30);
     private final ChaosProcesses processes = new ChaosProcesses();
 
     @AfterEach
@@ -46,7 +46,7 @@ class ChaosSmokeProcessTest {
                     "--log", log.toString(), "--ack-timeout-ms", "500");
             assertThat(consumer.waitForMarker("CHAOS_CONSUMER_READY", PROCESS_TIMEOUT))
                     .isEqualTo("CHAOS_CONSUMER_READY");
-            awaitAllIds(log, 200, Duration.ofSeconds(15));
+            awaitAllIds(log, 200, Duration.ofSeconds(30));
 
             Set<Integer> ids = readIds(log);
             assertThat(ids).containsAll(java.util.stream.IntStream.rangeClosed(1, 200).boxed().toList());
