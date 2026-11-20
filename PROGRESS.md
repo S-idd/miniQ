@@ -13,7 +13,9 @@
 - [x] Day 9: Plain-JDK TCP client, FIFO request/reply handling, bounded virtual-thread message dispatcher, auto-ACK support, and socket integration coverage
 - [x] Day 9 hardening: async auto-ACK completion, reply-timeout shutdown, expanded real-socket coverage
 - [x] Day 10: Standalone shaded server JAR, process-based chaos publisher/consumer, and bounded separate-process smoke test; hardening removes per-message fsync and treats stale ACKs as expected
-- [ ] Days 11–12: Checkpoint, Chaos Stage A, tag v0.1
+- [x] Day 11: Pure-Java chaos log verifier, shaded chaos JAR, and separate-process Stage A test and viva script
+- [x] Chaos Stage A passes; v0.1 ready to tag
+- [ ] Day 12: Checkpoint and tag v0.1
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
 - [ ] Days 18–21: Spring Boot starter and demo apps
 - [ ] Days 22–23: Benchmark and optional @EmbeddedMiniQ

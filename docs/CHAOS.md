@@ -51,3 +51,37 @@ java -cp "$CHAOS_CP" dev.miniq.chaos.ChaosConsumerMain --host 127.0.0.1 --port <
 After `CHAOS_CONSUMER_READY`, check that every id is present with `awk 'NF == 2 { seen[$1] = 1 } END { for (i = 1; i <= 200; i++) if (!seen[i]) exit 1 }' /tmp/miniq-received.log`. Stop the consumer and server processes after the check. The full Stage A kill-and-redeliver acceptance run remains the next chaos milestone.
 
 The consumer does not fsync each row. Stage A tests process termination with `SIGKILL`, which does not discard bytes already written to the operating system; fsync is needed for power loss, which Stage A does not test. Per-message fsync is slow enough to push ACKs past the 500 ms ACK timeout. If redelivery makes an ACK stale, the consumer reports `late ack for id X` to stderr and continues, as expected with at-least-once delivery.
+
+## Run Stage A (consumer crash)
+
+Run the process-based acceptance test from the repository root with Maven's `-am` option so the test uses the reactor-built server and client modules:
+
+```sh
+mvn -q -pl miniq-chaos -am verify
+```
+
+The `ChaosStageAProcessTest` starts a server process on an ephemeral port with a 500 ms default ACK timeout and the default 16 in-flight messages. It publishes ids 1–1000, starts consumer A with a 5 ms delay, and kills A with `destroyForcibly()` after at least 500 distinct ids are logged. Consumer B subscribes as a fresh connection and appends to the same log file. The test waits up to 30 seconds for verification, then asserts that no ids are missing and at least one delivery has `deliveryCount > 1`. Child processes are destroyed in `@AfterEach`.
+
+To run the viva script, first build the shaded JARs once:
+
+```sh
+mvn -q -DskipTests package
+scripts/chaos-demo.sh
+```
+
+The script does not build anything. If either shaded JAR is missing, it prints the package command and exits. It runs the same 1,000-message consumer-crash scenario, prints the `ChaosVerifyMain` report, and cleans up background processes with a trap. The Stage B broker-crash steps are reported as skipped because persistence is not implemented yet.
+
+Example report (the counts vary by run):
+
+```text
+Chaos verification: PASS
+Expected ids: 1..1000
+Total lines: 1008
+Distinct ids: 1000
+Missing ids: none
+Duplicate count: 8
+Redelivery count: 8
+Stage A PASS (exit 0): duplicate count=8, redelivery count=8
+```
+
+PASS means each expected id from 1 through 1000 appears at least once. Duplicate deliveries are allowed by the at-least-once guarantee; redelivery count counts log rows whose delivery count is greater than one.

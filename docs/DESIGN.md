@@ -186,8 +186,14 @@ None currently.
 ## Implementation notes (Day 10)
 
 - `MiniQServerMain` owns process startup, validates only the documented port, ACK timeout, and in-flight options, and reports the bound address with one stdout readiness line. Its shutdown hook closes the server before the caller-owned broker; the shaded `miniq-server.jar` includes core and selects this main class.
-- Chaos publisher and consumer mains depend on the client library; server/core are test-only dependencies in `miniq-chaos`. The consumer fsyncs `id deliveryCount` before optional processing delay and manual ACK so a forced process kill leaves a verifiable record of work received.
-- The Day 10 smoke acceptance test runs server, publisher, and consumer as child JVMs on the test classpath, checks all 200 ids with bounded waits, and forcibly cleans up children in `@AfterEach`. `scripts/chaos-demo.sh` runs the same no-crash smoke scenario; Stage A consumer-crash validation remains a later milestone.
+- Chaos publisher and consumer mains depend on the client library; server/core are test-only dependencies in `miniq-chaos`. The consumer writes each `id deliveryCount` row directly before optional processing delay and manual ACK. It does not fsync each row because Stage A tests SIGKILL, not power loss, and per-row fsync can exceed the ACK timeout.
+- The Day 10 smoke test runs server, publisher, and consumer as child JVMs on the test classpath, checks all 200 ids with bounded waits, and forcibly cleans up children in `@AfterEach`. `scripts/chaos-demo.sh` mirrors the process setup for a local smoke run.
+
+## Implementation notes (Day 11)
+
+- `ChaosVerifier` counts complete log rows, distinct ids, missing expected ids, duplicate rows, and redelivery rows; it ignores a non-LF-terminated final row because a forced process exit can interrupt a write.
+- `ChaosStageAProcessTest` and `scripts/chaos-demo.sh` publish 1,000 ids, kill consumer A after at least 500 distinct logged ids, then start a fresh consumer B that appends to the same log. PASS requires complete id coverage; Stage A additionally requires observed redelivery.
+- The shaded `miniq-chaos.jar` includes the JDK-only client dependency and exposes `ChaosVerifyMain`; the viva script consumes prebuilt shaded JARs and never builds them itself.
 
 ## Core API summary
 
