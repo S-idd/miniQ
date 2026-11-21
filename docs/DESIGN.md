@@ -82,7 +82,7 @@ Each subscription has a maximum of 16 in-flight messages by default; this is a c
 
 ## Persistence preview — v0.2, not built yet
 
-Each topic will have append-only segment files with a versioned header and length-prefixed records. A record will include record type, topic-local offset, payload length, payload bytes (UTF-8 as specified by the wire protocol), and a checksum. A bad checksum in the final record of the last segment is treated as a torn write: truncate that segment to the last good record. A bad checksum in any earlier record fails startup with an error naming the segment and offset. Segment rotation and retention are not part of the initial persistence preview.
+Each topic will have append-only segment files with a versioned header and length-prefixed records. A record will include record type, topic-local offset, payload bytes (UTF-8 as specified by the wire protocol), and a checksum; payload length is derived from the record length as described in `docs/PERSISTENCE.md`. A bad checksum in the final record of the last segment is treated as a torn write: truncate that segment to the last good record. A bad checksum in any earlier record fails startup with an error naming the segment and offset. Segment rolling is specified in `docs/PERSISTENCE.md`; retention is not part of the initial persistence preview.
 
 Append PUBLISH records before returning a successful PUBLISH response and ACK records before returning successful ACK. The configured fsync mode controls whether each append is forced before success: `NONE` is the default and provides process-crash recovery, while opt-in `EVERY_WRITE` forces file data and metadata (with best-effort directory sync on creation). On recovery, rebuild offsets and messages from PUBLISH records, apply ACK records, and mark all remaining unacked messages READY; do not restore IN_FLIGHT state or timers. This prevents recovered ACK records from being redelivered.
 
@@ -109,7 +109,7 @@ Limit each subscription to 16 unacknowledged messages by default. Reject unbound
 Treat payload as opaque UTF-8 text and recommend base64 for binary or LF-containing content. Reject custom escaping because it complicates framing and clients can use a standard encoding.
 
 ### Durable acknowledgements
-In v0.2, force PUBLISH and ACK records before their OK responses. Reject acknowledging before the ACK record is durable because a crash could then redeliver a message already reported as acknowledged.
+In v0.2, append PUBLISH and ACK records before their `OK` responses; the configured fsync mode controls forcing. `NONE` is the default and survives process kill, not power loss; `EVERY_WRITE` is opt-in. Append the ACK record before `OK` so a crash cannot redeliver a message already reported as acknowledged.
 
 ### Retry ordering
 Choose oldest READY offset first, while allowing timeout redelivery to rejoin the READY set. Reject strict global ordering because it would block later messages behind a slow or disconnected consumer.
@@ -195,6 +195,14 @@ None currently.
 - `ChaosStageAProcessTest` and `scripts/chaos-demo.sh` publish 1,000 ids, kill consumer A after at least 500 distinct logged ids, then start a fresh consumer B that appends to the same log. PASS requires complete id coverage; Stage A additionally requires observed redelivery.
 - The shaded `miniq-chaos.jar` includes the JDK-only client dependency and exposes `ChaosVerifyMain`; the viva script consumes prebuilt shaded JARs and never builds them itself.
 - TCP_NODELAY is enabled on every accepted server socket, and client requests plus server responses write each UTF-8 line and LF in one socket write to avoid Linux Nagle/delayed-ACK latency.
+
+## Implementation notes (Day 14)
+
+- `miniq-core` now has a JDK-only `dev.miniq.core.storage` package with the v0.2 record codec, topic-folder Base32 mapping, segment reader, and one-writer-per-topic segment writer; the broker core remains unintegrated until Day 16.
+- Segment scans distinguish EOF, incomplete tails, and corruption; only an incomplete EOF tail or a bad CRC on the final record of the last segment is recoverable under `docs/PERSISTENCE.md`.
+- Segment writes use a complete `FileChannel` write loop, default to `NONE`, support opt-in `EVERY_WRITE`, roll at the documented 16 MiB default, and resume the next offset when reopened.
+- Recovery closes and clears the current segment state when discarding a partial-header tail, so the next append creates a fresh segment at the recovered next offset.
+- Day 14 storage tests cover codec and CRC behavior, every truncation length and byte flip, header validation, partial-header recovery, rolling/reopen, missing segments, portable names, and externally locked concurrent appends.
 
 ## Core API summary
 
