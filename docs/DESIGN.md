@@ -82,9 +82,7 @@ Each subscription has a maximum of 16 in-flight messages by default; this is a c
 
 ## Persistence preview — v0.2, not built yet
 
-Each topic will have append-only segment files with a versioned header and length-prefixed records. A record will include record type, topic-local offset, payload length, payload bytes (UTF-8 as specified by the wire protocol), and a checksum. A bad checksum in the final record of the last segment is treated as a torn write: truncate that segment to the last good record. A bad checksum in any earlier record fails startup with an error naming the segment and offset. Segment rotation and retention are not part of the initial persistence preview.
-
-Append PUBLISH records before returning a successful PUBLISH response and ACK records before returning successful ACK. The configured fsync mode controls whether each append is forced before success: `NONE` is the default and provides process-crash recovery, while opt-in `EVERY_WRITE` forces file data and metadata (with best-effort directory sync on creation). On recovery, rebuild offsets and messages from PUBLISH records, apply ACK records, and mark all remaining unacked messages READY; do not restore IN_FLIGHT state or timers. This prevents recovered ACK records from being redelivered.
+v0.2 persistence is specified in docs/PERSISTENCE.md, which supersedes this preview.
 
 ## Decisions and trade-offs
 
@@ -109,7 +107,7 @@ Limit each subscription to 16 unacknowledged messages by default. Reject unbound
 Treat payload as opaque UTF-8 text and recommend base64 for binary or LF-containing content. Reject custom escaping because it complicates framing and clients can use a standard encoding.
 
 ### Durable acknowledgements
-In v0.2, force PUBLISH and ACK records before their OK responses. Reject acknowledging before the ACK record is durable because a crash could then redeliver a message already reported as acknowledged.
+In v0.2, append PUBLISH and ACK records before their OK responses; the configured fsync mode determines whether records are forced before success. Reject acknowledging before the ACK record is appended because process-crash recovery could then redeliver a message already reported as acknowledged.
 
 ### Retry ordering
 Choose oldest READY offset first, while allowing timeout redelivery to rejoin the READY set. Reject strict global ordering because it would block later messages behind a slow or disconnected consumer.
