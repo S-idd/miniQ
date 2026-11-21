@@ -2,8 +2,9 @@ package dev.miniq.core.storage;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.file.Files;
+import java.nio.channels.FileChannel;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -14,6 +15,11 @@ public final class SegmentReader {
         END_OF_FILE,
         TORN_TAIL,
         CORRUPTION
+    }
+
+    @FunctionalInterface
+    public interface RecordConsumer {
+        void accept(StorageRecord record) throws IOException;
     }
 
     public record ScanResult(Path segment, List<StorageRecord> records, long validBytes,
@@ -29,6 +35,15 @@ public final class SegmentReader {
         }
     }
 
+    /** Bounded streaming scan summary. Records are delivered as they are validated. */
+    public record ScanSummary(Path segment, long validBytes, StopReason stopReason,
+                              long failurePosition, Long failureOffset, String detail,
+                              long recordCount) {
+        public ScanSummary {
+            Objects.requireNonNull(stopReason, "stopReason must not be null");
+        }
+    }
+
     private SegmentReader() {
     }
 
@@ -36,39 +51,88 @@ public final class SegmentReader {
         return scan(segment, isLastSegment, new RecordCodec());
     }
 
+    /** Compatibility scan for callers that need a materialized list of records. */
     public static ScanResult scan(Path segment, boolean isLastSegment, RecordCodec codec) throws IOException {
+        List<StorageRecord> records = new ArrayList<>();
+        ScanSummary summary = scanEach(segment, isLastSegment, codec, records::add);
+        return new ScanResult(summary.segment(), records, summary.validBytes(), summary.stopReason(),
+                summary.failurePosition(), summary.failureOffset(), summary.detail());
+    }
+
+    /**
+     * Scans without retaining the segment bytes or all records in memory. At most one bounded
+     * record buffer is allocated at a time; the consumer is called only after full validation.
+     */
+    public static ScanSummary scanEach(Path segment, boolean isLastSegment, RecordCodec codec,
+                                       RecordConsumer consumer) throws IOException {
         Objects.requireNonNull(segment, "segment must not be null");
         Objects.requireNonNull(codec, "codec must not be null");
-        byte[] bytes = Files.readAllBytes(segment);
-        if (bytes.length < SegmentFormat.HEADER_BYTES) {
-            StopReason reason = classifyFailure(RecordCodec.Status.INCOMPLETE, null, isLastSegment, true);
-            return stopped(segment, List.of(), 0, reason, 0, null, "short segment header");
-        }
-        String headerError = SegmentFormat.headerError(bytes);
-        if (headerError != null) {
-            return stopped(segment, List.of(), 0, StopReason.CORRUPTION, 0, null, headerError);
-        }
+        Objects.requireNonNull(consumer, "consumer must not be null");
 
-        List<StorageRecord> records = new ArrayList<>();
-        ByteBuffer input = ByteBuffer.wrap(bytes);
-        int position = SegmentFormat.HEADER_BYTES;
-        while (position < bytes.length) {
-            input.position(position);
-            RecordCodec.DecodeResult decoded = codec.decode(input);
-            if (decoded.status() != RecordCodec.Status.COMPLETE) {
-                long encodedSize = RecordCodec.LENGTH_PREFIX_BYTES + decoded.recordBytes();
-                boolean reachesEof = decoded.status() == RecordCodec.Status.INCOMPLETE
-                        || (decoded.recordBytes() >= 0
-                        && encodedSize <= Long.MAX_VALUE - position
-                        && position + encodedSize == bytes.length);
-                StopReason reason = classifyFailure(decoded.status(), decoded.failure(), isLastSegment, reachesEof);
-                String detail = decoded.failure() == null ? "incomplete record" : decoded.failure().name();
-                return stopped(segment, records, position, reason, position, decoded.offset(), detail);
+        try (FileChannel channel = FileChannel.open(segment, StandardOpenOption.READ)) {
+            long size = channel.size();
+            int headerLength = (int) Math.min(size, SegmentFormat.HEADER_BYTES);
+            ByteBuffer header = ByteBuffer.allocate(headerLength);
+            readFully(channel, header, 0);
+            byte[] headerBytes = header.array();
+            if (headerLength < SegmentFormat.HEADER_BYTES) {
+                StopReason reason = classifyFailure(RecordCodec.Status.INCOMPLETE, null, isLastSegment, true);
+                return summary(segment, 0, reason, 0, null, "short segment header", 0);
             }
-            records.add(decoded.record());
-            position += decoded.bytesConsumed();
+            String headerError = SegmentFormat.headerError(headerBytes);
+            if (headerError != null) {
+                return summary(segment, 0, StopReason.CORRUPTION, 0, null, headerError, 0);
+            }
+
+            long position = SegmentFormat.HEADER_BYTES;
+            long recordCount = 0;
+            while (position < size) {
+                long remaining = size - position;
+                int prefixLength = (int) Math.min(remaining, RecordCodec.LENGTH_PREFIX_BYTES);
+                ByteBuffer prefix = ByteBuffer.allocate(prefixLength);
+                readFully(channel, prefix, position);
+                if (prefixLength < RecordCodec.LENGTH_PREFIX_BYTES) {
+                    RecordCodec.DecodeResult decoded = codec.decode(prefix.flip());
+                    return failed(segment, decoded, isLastSegment, true, position, position, recordCount);
+                }
+
+                long declared = Integer.toUnsignedLong(prefix.getInt(0));
+                if (declared < RecordCodec.FIXED_RECORD_BYTES || declared > codec.maxRecordBytes()) {
+                    int sampleLength = (int) Math.min(remaining,
+                            RecordCodec.LENGTH_PREFIX_BYTES + 1L + Long.BYTES);
+                    ByteBuffer sample = ByteBuffer.allocate(sampleLength);
+                    readFully(channel, sample, position);
+                    RecordCodec.DecodeResult decoded = codec.decode(sample.flip());
+                    return failed(segment, decoded, isLastSegment,
+                            RecordCodec.LENGTH_PREFIX_BYTES + declared == remaining,
+                            position, position, recordCount);
+                }
+
+                long total = RecordCodec.LENGTH_PREFIX_BYTES + declared;
+                if (total > remaining) {
+                    int sampleLength = (int) Math.min(remaining,
+                            RecordCodec.LENGTH_PREFIX_BYTES + 1L + Long.BYTES);
+                    ByteBuffer sample = ByteBuffer.allocate(sampleLength);
+                    readFully(channel, sample, position);
+                    RecordCodec.DecodeResult decoded = codec.decode(sample.flip());
+                    return failed(segment, decoded, isLastSegment, true, position, position, recordCount);
+                }
+
+                ByteBuffer encoded = ByteBuffer.allocate((int) total);
+                readFully(channel, encoded, position);
+                encoded.flip();
+                RecordCodec.DecodeResult decoded = codec.decode(encoded);
+                if (decoded.status() != RecordCodec.Status.COMPLETE) {
+                    boolean reachesEof = total == remaining;
+                    return failed(segment, decoded, isLastSegment, reachesEof,
+                            position, position, recordCount);
+                }
+                consumer.accept(decoded.record());
+                position += decoded.bytesConsumed();
+                recordCount++;
+            }
+            return summary(segment, position, StopReason.END_OF_FILE, -1, null, null, recordCount);
         }
-        return new ScanResult(segment, records, position, StopReason.END_OF_FILE, -1, null, null);
     }
 
     /** The persistence rule: only an incomplete EOF tail or a final bad CRC may be truncated. */
@@ -82,9 +146,32 @@ public final class SegmentReader {
         return StopReason.CORRUPTION;
     }
 
-    private static ScanResult stopped(Path segment, List<StorageRecord> records, long validBytes,
-                                     StopReason reason, long failurePosition,
-                                     Long failureOffset, String detail) {
-        return new ScanResult(segment, records, validBytes, reason, failurePosition, failureOffset, detail);
+    private static ScanSummary failed(Path segment, RecordCodec.DecodeResult decoded, boolean isLastSegment,
+                                     boolean reachesEof, long position, long failurePosition,
+                                     long recordCount) {
+        StopReason reason = classifyFailure(decoded.status(), decoded.failure(), isLastSegment, reachesEof);
+        String detail = decoded.failure() == null ? "incomplete record" : decoded.failure().name();
+        return summary(segment, position, reason, failurePosition, decoded.offset(), detail, recordCount);
+    }
+
+    private static ScanSummary summary(Path segment, long validBytes, StopReason reason,
+                                      long failurePosition, Long failureOffset, String detail,
+                                      long recordCount) {
+        return new ScanSummary(segment, validBytes, reason, failurePosition,
+                failureOffset, detail, recordCount);
+    }
+
+    private static void readFully(FileChannel channel, ByteBuffer buffer, long position) throws IOException {
+        long current = position;
+        while (buffer.hasRemaining()) {
+            int read = channel.read(buffer, current);
+            if (read < 0) {
+                break;
+            }
+            if (read == 0) {
+                throw new IOException("file channel made no progress while scanning segment");
+            }
+            current += read;
+        }
     }
 }

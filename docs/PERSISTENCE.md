@@ -89,6 +89,7 @@ Those delays caused CI timing flakes; `NONE` avoids them while `EVERY_WRITE` rem
 ## 7. Startup recovery algorithm
 
 1. Open the configured data directory and enumerate its `topics/` folders. Decode each canonical Base32 suffix to recover the exact topic name; reject malformed, non-canonical, or protocol-invalid names.
+   Ignore entries in `topics/` whose names start with `.`; every other entry must be a valid topic folder or recovery fails with an error naming that entry.
 2. Enumerate each topic's segment files and sort by numeric sequence. The sequence must begin at zero and be contiguous. A missing middle sequence fails startup; do not skip it and silently accept a history with a hole.
 3. Validate each segment header (magic, version, and reserved bits), then scan records in order. Check each length against the minimum, maximum, and remaining segment bytes before allocation; verify CRC32 and validate record type and field values.
 4. Initialize each topic's `nextOffset` to 0 and initialize the broker-wide recovered payload-byte total to zero. For each PUBLISH, require its offset to equal the current `nextOffset`, add its raw UTF-8 payload length to the total, and fail startup with a clear payload-limit error if the total exceeds 268,435,456 bytes. No message is lost to the cap: never drop or skip a recovered message to fit it. Otherwise create the immutable message, add it to the in-memory message lookup and READY set, then increment `nextOffset`. A gap, duplicate, or decreasing PUBLISH offset fails startup.
