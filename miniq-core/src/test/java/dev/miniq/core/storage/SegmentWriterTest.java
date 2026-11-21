@@ -100,6 +100,59 @@ class SegmentWriterTest {
     }
 
     @Test
+    void recoveryFromPartialHeaderAfterCompleteSegmentStartsFreshSegment() throws IOException {
+        Path dataDir = tempDir.resolve("partial-tail-data");
+        Path topicDirectory;
+        try (SegmentWriter writer = SegmentWriter.open(dataDir, "partial-tail")) {
+            writer.appendPublish("zero", 1);
+            writer.appendPublish("one", 2);
+            writer.appendPublish("two", 3);
+            topicDirectory = writer.topicDirectory();
+        }
+
+        Path previousSegment = topicDirectory.resolve(SegmentFormat.fileName(0, 0));
+        byte[] previousBytes = Files.readAllBytes(previousSegment);
+        Path partialSegment = topicDirectory.resolve(SegmentFormat.fileName(3, 1));
+        Files.write(partialSegment, new byte[]{'M', 'I', 'N', 'Q', 0});
+
+        try (SegmentWriter reopened = SegmentWriter.open(dataDir, "partial-tail")) {
+            assertThat(reopened.nextOffset()).isEqualTo(3);
+            assertThat(Files.exists(partialSegment)).isFalse();
+            assertThat(reopened.appendPublish("three", 4)).isEqualTo(3);
+        }
+
+        Path newSegment = topicDirectory.resolve(SegmentFormat.fileName(3, 1));
+        assertThat(Files.exists(newSegment))
+                .as("append after deleting a partial header should create a fresh segment")
+                .isTrue();
+        assertThat(Files.readAllBytes(newSegment)).startsWith(SegmentFormat.header());
+        assertThat(Files.readAllBytes(previousSegment)).isEqualTo(previousBytes);
+        assertThat(scanDirectory(topicDirectory)).extracting(StorageRecord::offset)
+                .containsExactly(0L, 1L, 2L, 3L);
+    }
+
+    @Test
+    void recoveryFromOnlyPartialHeaderCreatesValidFirstSegment() throws IOException {
+        Path dataDir = tempDir.resolve("only-partial-data");
+        Path topicDirectory = dataDir.resolve("topics").resolve(TopicDirectoryNames.forTopic("only-partial"));
+        Files.createDirectories(topicDirectory);
+        Path partialSegment = topicDirectory.resolve(SegmentFormat.fileName(0, 0));
+        Files.write(partialSegment, new byte[]{'M', 'I', 'N', 'Q', 0});
+
+        try (SegmentWriter reopened = SegmentWriter.open(dataDir, "only-partial")) {
+            assertThat(reopened.nextOffset()).isZero();
+            assertThat(reopened.appendPublish("first", 1)).isZero();
+        }
+
+        Path firstSegment = topicDirectory.resolve(SegmentFormat.fileName(0, 0));
+        assertThat(Files.exists(firstSegment)).isTrue();
+        SegmentReader.ScanResult scan = SegmentReader.scan(firstSegment, true);
+        assertThat(scan.stopReason()).isEqualTo(SegmentReader.StopReason.END_OF_FILE);
+        assertThat(scan.records()).containsExactly(StorageRecord.publish(0, 1,
+                RecordCodec.utf8Payload("first")));
+    }
+
+    @Test
     void topicFoldersAndSegmentNamesArePortableAcrossCaseSensitiveAndInsensitiveFilesystems() throws IOException {
         Path dataDir = tempDir.resolve("portable-data");
         try (SegmentWriter upper = SegmentWriter.open(dataDir, "Orders");
@@ -195,5 +248,19 @@ class SegmentWriterTest {
         try (var paths = Files.list(directory)) {
             return paths.map(path -> path.getFileName().toString()).sorted().toList();
         }
+    }
+
+    private static List<StorageRecord> scanDirectory(Path directory) throws IOException {
+        List<Path> segments;
+        try (var paths = Files.list(directory)) {
+            segments = paths.sorted().toList();
+        }
+        List<StorageRecord> records = new ArrayList<>();
+        for (int index = 0; index < segments.size(); index++) {
+            SegmentReader.ScanResult scan = SegmentReader.scan(segments.get(index), index == segments.size() - 1);
+            assertThat(scan.stopReason()).isEqualTo(SegmentReader.StopReason.END_OF_FILE);
+            records.addAll(scan.records());
+        }
+        return records;
     }
 }

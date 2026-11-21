@@ -133,6 +133,41 @@ class SegmentReaderTest {
                 .isEqualTo(SegmentReader.StopReason.CORRUPTION);
     }
 
+    @Test
+    void everyByteFlipReturnsOnlyAnIntactRecordPrefixAndIsNotACleanScan() throws IOException {
+        Path dataDir = tempDir.resolve("every-byte-flip-data");
+        Path segment;
+        try (SegmentWriter writer = SegmentWriter.open(dataDir, "every-byte-flip")) {
+            writer.appendPublish("alpha", 1);
+            writer.appendPublish("bravo", 2);
+            writer.appendPublish("charlie", 3);
+            writer.appendAck(0, 4);
+            writer.appendAck(2, 5);
+            segment = onlySegment(writer.topicDirectory());
+        }
+
+        byte[] originalBytes = Files.readAllBytes(segment);
+        List<StorageRecord> originalRecords = SegmentReader.scan(segment, true).records();
+        assertThat(originalRecords).hasSize(5);
+
+        for (int byteIndex = 0; byteIndex < originalBytes.length; byteIndex++) {
+            byte[] flipped = originalBytes.clone();
+            flipped[byteIndex] ^= 0x01;
+            Files.write(segment, flipped);
+
+            SegmentReader.ScanResult scan = SegmentReader.scan(segment, true);
+            assertThat(scan.records().size())
+                    .as("intact prefix length after flipping byte %s", byteIndex)
+                    .isLessThanOrEqualTo(originalRecords.size());
+            assertThat(scan.records())
+                    .as("records after flipping byte %s", byteIndex)
+                    .containsExactlyElementsOf(originalRecords.subList(0, scan.records().size()));
+            assertThat(scan.isClean())
+                    .as("scan after flipping byte %s", byteIndex)
+                    .isFalse();
+        }
+    }
+
     private Path createOneRecordSegment() throws IOException {
         try (SegmentWriter writer = SegmentWriter.open(tempDir.resolve("data"), "reader-topic")) {
             writer.appendPublish("one", 1);

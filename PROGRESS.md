@@ -21,7 +21,7 @@
 - [x] TCP latency follow-up: confirmed ~42 ms Linux publish latency from Nagle/delayed-ACK interaction; enabled TCP_NODELAY on accepted sockets and switched both protocol writers to one-write line framing; three Linux Docker full-reactor verifications pass
 - [x] Test follow-up: concurrent consumers now retry stale/expired ACK attempts under sub-second real-clock timeouts; stress and chaos tests passed 50 local runs each, 50 each under four-process CPU load, and 20 each in one-CPU Docker
 - [x] Day 13 persistence design review: clarified fail-closed recovery over the 256 MiB payload cap, bounded record allocation, cross-topic atomic payload reservations, fsync-mode consistency, and same-PR Day 16 protocol error documentation
-- [x] Day 14: JDK-only record codec, segment reader/writer, CRC and torn-tail validation, rolling/reopen, and storage tests; broker integration remains for Day 16
+- [x] Day 14: JDK-only record codec, segment reader/writer, CRC and torn-tail validation, partial-header recovery, full-segment byte-flip coverage, rolling/reopen, and storage tests; broker integration remains for Day 16
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
 - [ ] Days 18–21: Spring Boot starter and demo apps
 - [ ] Days 22–23: Benchmark and optional @EmbeddedMiniQ

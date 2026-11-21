@@ -201,7 +201,8 @@ None currently.
 - `miniq-core` now has a JDK-only `dev.miniq.core.storage` package with the v0.2 record codec, topic-folder Base32 mapping, segment reader, and one-writer-per-topic segment writer; the broker core remains unintegrated until Day 16.
 - Segment scans distinguish EOF, incomplete tails, and corruption; only an incomplete EOF tail or a bad CRC on the final record of the last segment is recoverable under `docs/PERSISTENCE.md`.
 - Segment writes use a complete `FileChannel` write loop, default to `NONE`, support opt-in `EVERY_WRITE`, roll at the documented 16 MiB default, and resume the next offset when reopened.
-- Day 14 storage tests cover codec and CRC behavior, every truncation length, header validation, rolling/reopen, missing segments, portable names, and externally locked concurrent appends.
+- Recovery closes and clears the current segment state when discarding a partial-header tail, so the next append creates a fresh segment at the recovered next offset.
+- Day 14 storage tests cover codec and CRC behavior, every truncation length and byte flip, header validation, partial-header recovery, rolling/reopen, missing segments, portable names, and externally locked concurrent appends.
 
 ## Core API summary
 

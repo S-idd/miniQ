@@ -151,12 +151,12 @@ public final class SegmentWriter implements AutoCloseable {
         if (channel == null) {
             createSegment(nextSequence);
         } else if (currentHasRecords && currentSize + recordSize > config.segmentSizeBytes()) {
-            closeCurrentChannel();
             createSegment(nextSequence);
         }
     }
 
     private void createSegment(int sequence) throws IOException {
+        closeCurrentSegment();
         if (sequence > 99_999_999) {
             throw new IOException("segment sequence space is exhausted");
         }
@@ -259,12 +259,9 @@ public final class SegmentWriter implements AutoCloseable {
                     throw new IOException("torn non-final segment: " + path.getFileName());
                 }
                 if (scan.validBytes() == 0) {
+                    closeCurrentSegment();
                     Files.delete(path);
                     removedPartialHeader = true;
-                    currentPath = null;
-                    currentSequence = -1;
-                    currentSize = 0;
-                    currentHasRecords = false;
                     nextSequence = name.sequence();
                 } else {
                     try (FileChannel repair = FileChannel.open(path, StandardOpenOption.WRITE)) {
@@ -312,9 +309,15 @@ public final class SegmentWriter implements AutoCloseable {
     }
 
     private void openExistingCurrent(Path path, int sequence, long size, boolean hasRecords) throws IOException {
-        closeCurrentChannel();
-        channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
-        channel.position(size);
+        closeCurrentSegment();
+        FileChannel reopened = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        try {
+            reopened.position(size);
+        } catch (IOException exception) {
+            reopened.close();
+            throw exception;
+        }
+        channel = reopened;
         currentPath = path;
         currentSequence = sequence;
         currentSize = size;
@@ -333,17 +336,24 @@ public final class SegmentWriter implements AutoCloseable {
     private void failClosed() {
         failed = true;
         try {
-            closeCurrentChannel();
+            closeCurrentSegment();
         } catch (IOException ignored) {
             // Preserve the original append failure.
         }
     }
 
-    private void closeCurrentChannel() throws IOException {
-        if (channel != null) {
-            FileChannel old = channel;
-            channel = null;
-            old.close();
+    private void closeCurrentSegment() throws IOException {
+        FileChannel old = channel;
+        channel = null;
+        try {
+            if (old != null) {
+                old.close();
+            }
+        } finally {
+            currentPath = null;
+            currentSequence = -1;
+            currentSize = 0;
+            currentHasRecords = false;
         }
     }
 
@@ -368,7 +378,7 @@ public final class SegmentWriter implements AutoCloseable {
         if (!closed) {
             closed = true;
             try {
-                closeCurrentChannel();
+                closeCurrentSegment();
             } finally {
                 OPEN_TOPIC_DIRECTORIES.remove(topicDirectory);
             }
