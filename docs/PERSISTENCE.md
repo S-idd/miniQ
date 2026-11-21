@@ -36,7 +36,7 @@ All integer fields are big-endian. A segment begins with this fixed eight-byte h
 | 4 | 2 | Version | Unsigned version, currently `1` |
 | 6 | 2 | Reserved | Must be zero in version 1 |
 
-Each record follows the header and has a four-byte length prefix. `recordBytes` is the number of bytes after the prefix, including the CRC. Its minimum is 21 bytes. A record's CRC is the standard CRC-32/IEEE value over the type, offset, timestamp, and payload fields; the length prefix and CRC field itself are excluded.
+Each record follows the header and has a four-byte length prefix. `recordBytes` is the number of bytes after the prefix, including the CRC. Its minimum is 21 bytes. The maximum is 268,435,477 bytes (the 256 MiB payload cap plus the 21 fixed bytes for type, offset, timestamp, and CRC). Recovery validates the unsigned length against both bounds and the bytes remaining in the segment before allocating a record buffer. A record's CRC is the standard CRC-32/IEEE value over the type, offset, timestamp, and payload fields; the length prefix and CRC field itself are excluded.
 
 | Byte offset relative to record | Size | Field | Meaning |
 |---:|---:|---|---|
@@ -90,8 +90,8 @@ Those delays caused CI timing flakes; `NONE` avoids them while `EVERY_WRITE` rem
 
 1. Open the configured data directory and enumerate its `topics/` folders. Decode each canonical Base32 suffix to recover the exact topic name; reject malformed, non-canonical, or protocol-invalid names.
 2. Enumerate each topic's segment files and sort by numeric sequence. The sequence must begin at zero and be contiguous. A missing middle sequence fails startup; do not skip it and silently accept a history with a hole.
-3. Validate each segment header (magic, version, and reserved bits), then scan records in order. Check each length before allocation, verify CRC32, and validate record type and field values.
-4. Initialize each topic's `nextOffset` to 0. For each PUBLISH, require its offset to equal the current `nextOffset`, create the immutable message, add it to the in-memory message lookup and READY set, then increment `nextOffset`. A gap, duplicate, or decreasing PUBLISH offset fails startup.
+3. Validate each segment header (magic, version, and reserved bits), then scan records in order. Check each length against the minimum, maximum, and remaining segment bytes before allocation; verify CRC32 and validate record type and field values.
+4. Initialize each topic's `nextOffset` to 0 and initialize the broker-wide recovered payload-byte total to zero. For each PUBLISH, require its offset to equal the current `nextOffset`, add its raw UTF-8 payload length to the total, and fail startup with a clear payload-limit error if the total exceeds 268,435,456 bytes. No message is lost to the cap: never drop or skip a recovered message to fit it. Otherwise create the immutable message, add it to the in-memory message lookup and READY set, then increment `nextOffset`. A gap, duplicate, or decreasing PUBLISH offset fails startup.
 5. For each ACK, require that the PUBLISH for its offset has already appeared. Add the offset to the ACKED set and remove it from READY. Repeated ACKs are harmless and leave it ACKED.
 6. If a record is incomplete at end-of-file in the last segment, or its checksum is bad and it is the final record in the last segment, treat it as a torn tail: truncate to the byte immediately before that record and continue. A malformed complete record is not a torn tail.
 7. Any bad checksum, incomplete record, or invalid record before the final record of the final segment fails startup with an error naming the segment and offset when available. A bad checksum in an earlier segment always fails startup, including that segment's last record.
@@ -118,17 +118,17 @@ The core classes that change are:
 
 The public in-memory constructors and method behavior stay compatible, so existing core tests continue to instantiate the same in-memory types without edits. New persistence tests use the file-backed factory. The server startup wiring can pass the file-backed configuration; no new wire command is needed.
 
-Ordering is strict: a complete PUBLISH record is appended (and forced under `EVERY_WRITE`) before `OK <offset>` is returned; a complete ACK record is appended (and forced under `EVERY_WRITE`) before the message becomes ACKED and `OK` is returned.
+Ordering is strict: a complete PUBLISH record is appended under the selected fsync mode before `OK <offset>` is returned; a complete ACK record is appended under the selected fsync mode before the message becomes ACKED and `OK` is returned. `NONE` does not force records; `EVERY_WRITE` forces them before success.
 
 ## 9. Failure handling
 
 A failed PUBLISH or ACK append returns `ERR SERVER_ERROR`, which is already listed in `docs/PROTOCOL.md`. No in-memory state changes when an append fails: a PUBLISH consumes no offset and adds no message, while a failed ACK leaves the message in its prior state. The file log fails closed after an append error so later writes do not follow an ambiguous partial record.
 
-The 256 MiB payload cap is aggregate across the broker, summed across all topics and including ACKED payloads that remain in the log. A PUBLISH that would exceed the cap is rejected before append with `ERR PAYLOAD_LIMIT`; no offset or message state is changed. If recovery finds persisted payload bytes above the cap, startup fails with a clear limit error. Add `PAYLOAD_LIMIT` to the error-code table in `docs/PROTOCOL.md` in a later documentation task; do not change the protocol in this design task. `SERVER_ERROR` remains the code for append I/O failures.
+The 256 MiB payload cap is aggregate across the broker, summed across all topics and including ACKED payloads that remain in the log. A broker-wide atomic byte budget counts committed payloads and pending reservations. Every PUBLISH reserves its raw UTF-8 payload bytes against that budget before append; concurrent publishes to different topics therefore cannot each spend the same remaining capacity. If reservation would exceed the cap, reject with `ERR PAYLOAD_LIMIT` before append and leave the offset and message state unchanged. A successful append commits the reservation. A definite append failure releases it; if an I/O error leaves append completion ambiguous, keep the reservation charged and fail that topic's log closed until restart, so other publishes cannot spend potentially persisted bytes. Recovery rebuilds the total from all PUBLISH records, including ACKED ones, and startup fails with a clear error naming the recovered total and 256 MiB limit if it exceeds the cap. No recovered message is silently dropped. Add `PAYLOAD_LIMIT` to the error-code table in `docs/PROTOCOL.md` in the same Day 16 PR that implements the cap and returns this error; do not add it in this design-only PR. `SERVER_ERROR` remains the code for append I/O failures.
 
 ## 10. Concurrency and disk access
 
-The existing per-topic `TopicDelivery` lock serializes the publish and ACK operations that reach the log. `Topic`'s existing lock continues to protect the in-memory message lookup and next-offset state; the file writer is only called while the delivery lock is held, so record order matches state-transition order. No separate writer thread is introduced.
+The existing per-topic `TopicDelivery` lock serializes the publish and ACK operations that reach the log. `Topic`'s existing lock continues to protect the in-memory message lookup and next-offset state; the file writer is only called while the delivery lock is held, so record order matches state-transition order. The broker-wide payload budget uses an atomic reservation counter, not a lock held over file I/O, to account safely across different topic locks. No separate writer thread is introduced.
 
 File append and optional force happen while the command path holds the topic delivery lock. This can delay other publishes, ACKs, and delivery-state transitions for that topic, especially in `EVERY_WRITE`; that is an accepted v0.2 development-broker trade-off for simple ordering. Different topics have separate locks and log files. The timeout thread only changes in-memory IN_FLIGHT/READY state, and the pump only selects in-memory READY messages and enqueues them; neither touches the disk.
 
@@ -142,7 +142,7 @@ The v0.2 development-broker limit is 256 MiB of aggregate raw UTF-8 payload byte
 
 - **Day 14:** unit tests for header/record codec, byte order, record lengths, PUBLISH and ACK encoding, CRC32, payload round-trip, segment naming, rolling boundaries, and torn final records.
 - **Day 15:** recovery tests using segment files created and corrupted by hand: final-tail truncation; bad CRC in an earlier record/segment; missing middle segment; empty and header-only tail segments; duplicate ACK; ACK for a missing offset; malformed headers/lengths; offset continuity; and crash after append before in-memory update.
-- **Day 16:** file-backed publish/ACK integration tests proving append-before-OK and no state change on append failure; concurrency tests for concurrent publishes/ACKs and segment rolling under the topic lock. Existing in-memory tests stay unchanged.
+- **Day 16:** file-backed publish/ACK integration tests proving append-before-OK, no state change on append failure, and `PAYLOAD_LIMIT` in `docs/PROTOCOL.md` in this same implementation PR; concurrency tests for cross-topic aggregate-cap reservations, concurrent publishes/ACKs, and segment rolling under the topic lock. Existing in-memory tests stay unchanged.
 - **Day 17:** Chaos Stage B steps 7–10 from `docs/CHAOS.md`: kill the broker process with `kill -9` during a run, restart it on the same data directory, reconnect consumers, verify all ids are received, and explicitly assert that every message ACKed before the crash is not redelivered after recovery. Keep the automated test and `scripts/chaos-demo.sh` scenario in sync; tag v0.2 only after Stage B passes.
 
 ## 13. Schedule
@@ -176,6 +176,9 @@ Restore every unACKed message as READY and do not persist ownership, timeout, or
 
 ### Payload memory
 Keep every payload in memory after recovery, with a 256 MiB raw-payload development limit. Disk reads during pumping were rejected for v0.2 because they complicate dispatch and add I/O under the delivery path; retention/compaction are out of scope.
+
+### Aggregate payload accounting
+Reserve payload bytes through one broker-wide atomic budget before any topic log append, so concurrent publishes cannot exceed the aggregate 256 MiB cap. Rebuild the same total during recovery and fail startup clearly if persisted payloads exceed it; dropping recovered messages was rejected because it violates no-message-loss behavior.
 
 ## Open questions
 
