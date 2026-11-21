@@ -1,5 +1,7 @@
 package dev.miniq.core.storage;
 
+import dev.miniq.core.Topic;
+
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.DirectoryStream;
@@ -19,14 +21,24 @@ import java.util.TreeMap;
 public final class StorageRecovery {
     public static final long MAX_RECOVERED_PAYLOAD_BYTES = 268_435_456L;
 
-    private final RecordCodec codec = new RecordCodec();
+    private final RecordCodec codec;
+
+    private StorageRecovery(RecordCodec codec) {
+        this.codec = codec;
+    }
 
     /** Recovers data from the writer's {@code dataDirectory/topics} layout. */
     public static RecoveryResult recover(Path dataDirectory) throws RecoveryException {
-        return new StorageRecovery().recoverDataDirectory(dataDirectory);
+        return recover(dataDirectory, Topic.DEFAULT_MAX_LINE_BYTES);
     }
 
-    public RecoveryResult recoverDataDirectory(Path dataDirectory) throws RecoveryException {
+    /** Recovers data using the payload limit derived from the configured maximum protocol line. */
+    public static RecoveryResult recover(Path dataDirectory, int maxLineBytes) throws RecoveryException {
+        return new StorageRecovery(RecordCodec.forMaxLineBytes(maxLineBytes))
+                .recoverDataDirectory(dataDirectory);
+    }
+
+    private RecoveryResult recoverDataDirectory(Path dataDirectory) throws RecoveryException {
         if (dataDirectory == null) {
             throw new RecoveryException("data directory must not be null", null, null, null);
         }
@@ -146,8 +158,12 @@ public final class StorageRecovery {
 
             if (scan.stopReason() == SegmentReader.StopReason.CORRUPTION) {
                 String offset = scan.failureOffset() == null ? "" : " offset " + scan.failureOffset();
+                String detail = scan.detail();
+                if (RecordCodec.Failure.RECORD_TOO_LARGE.name().equals(detail)) {
+                    detail += "; data may have been written with a larger max line limit";
+                }
                 throw new RecoveryException("corrupt segment " + path.getFileName() + " for topic "
-                        + topic.name + " at byte " + scan.failurePosition() + offset + ": " + scan.detail(),
+                        + topic.name + " at byte " + scan.failurePosition() + offset + ": " + detail,
                         topic.name, path, scan.failureOffset());
             }
             if (!last && scan.recordCount() == 0) {
