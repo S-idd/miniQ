@@ -196,6 +196,13 @@ None currently.
 - The shaded `miniq-chaos.jar` includes the JDK-only client dependency and exposes `ChaosVerifyMain`; the viva script consumes prebuilt shaded JARs and never builds them itself.
 - TCP_NODELAY is enabled on every accepted server socket, and client requests plus server responses write each UTF-8 line and LF in one socket write to avoid Linux Nagle/delayed-ACK latency.
 
+## Implementation notes (Day 14)
+
+- `miniq-core` now has a JDK-only `dev.miniq.core.storage` package with the v0.2 record codec, topic-folder Base32 mapping, segment reader, and one-writer-per-topic segment writer; the broker core remains unintegrated until Day 16.
+- Segment scans distinguish EOF, incomplete tails, and corruption; only an incomplete EOF tail or a bad CRC on the final record of the last segment is recoverable under `docs/PERSISTENCE.md`.
+- Segment writes use a complete `FileChannel` write loop, default to `NONE`, support opt-in `EVERY_WRITE`, roll at the documented 16 MiB default, and resume the next offset when reopened.
+- Day 14 storage tests cover codec and CRC behavior, every truncation length, header validation, rolling/reopen, missing segments, portable names, and externally locked concurrent appends.
+
 ## Core API summary
 
 ### Public methods
