@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -167,68 +168,97 @@ class MiniqServerSocketTest {
 
     @Test
     void slowConsumerIsDisconnectedWithoutBlockingPublishersOrOtherConsumers() throws Exception {
-        // BrokerConfig arguments are (default ACK timeout ms, max in-flight, max line bytes).
-        long ackTimeoutMs = 60_000;
-        int maxInFlight = 60_000;
-        int maxLineBytes = 65_536;
-        BrokerConfig config = new BrokerConfig(ackTimeoutMs, maxInFlight, maxLineBytes);
-        try (Running running = new Running(config)) {
-            Socket slow = new Socket();
-            slow.setReceiveBufferSize(1_024);
-            slow.connect(new java.net.InetSocketAddress("127.0.0.1", running.server.port()));
-            slow.setSoTimeout(10_000);
-            socketWrite(slow, "SUBSCRIBE slow");
-            assertThat(read(slow)).isEqualTo("OK");
-            int messageCount = 2_048;
-            int payloadBytes = 32 * 1_024;
-            // 64 MiB total exceeds the 1,024-line queue (~32 MiB) plus loopback socket buffers.
-            String payload = "x".repeat(payloadBytes);
+        int outboundCapacity = 4;
+        BrokerConfig config = new BrokerConfig(60_000,
+                outboundCapacity - MiniqServer.NON_MSG_RESPONSE_RESERVE, 65_536);
+        try (Running running = new Running(config, outboundCapacity);
+             GatedSocket slowSocket = new GatedSocket(true)) {
             try (Socket publisher = running.connect()) {
-                BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
-                        publisher.getOutputStream(), StandardCharsets.UTF_8), 64 * 1_024);
-                int batchSize = 128;
-                for (int start = 0; start < messageCount; start += batchSize) {
-                    int batchEnd = Math.min(start + batchSize, messageCount);
-                    for (int i = start; i < batchEnd; i++) {
-                        writer.write("PUBLISH slow " + payload);
-                        writer.write('\n');
-                    }
-                    writer.flush();
-                    for (int i = start; i < batchEnd; i++) {
-                        assertThat(read(publisher)).startsWith("OK ");
-                    }
+                for (int i = 0; i < 3; i++) {
+                    socketWrite(publisher, "PUBLISH slow pre" + i);
+                    assertThat(read(publisher)).isEqualTo("OK " + i);
                 }
             }
-            BrokerStats.TopicStats disconnected = awaitSlowClientDisconnect(
-                    running.broker, "slow", messageCount);
-            assertThat(disconnected.ready()).isEqualTo(messageCount);
-            assertThat(disconnected.inFlight()).isZero();
-            try (Socket publisher = running.connect()) {
-                socketWrite(publisher, "PUBLISH healthy still-working");
-                assertThat(read(publisher)).isEqualTo("OK 0");
-            }
+
+            CountDownLatch slowClosed = new CountDownLatch(1);
+            ClientConnection slow = new ClientConnection(running.broker, config, "gated-slow", slowSocket,
+                    slowClosed::countDown, outboundCapacity);
+            slow.start();
+            slowSocket.send("SUBSCRIBE slow\n");
+            assertThat(slowSocket.awaitWriteEntered(5, TimeUnit.SECONDS)).isTrue();
+            awaitTopic(running.broker, "slow", stats -> stats.inFlight() == 2);
+
             try (Socket healthy = running.connect()) {
-                socketWrite(healthy, "SUBSCRIBE healthy");
+                socketWrite(healthy, "SUBSCRIBE slow");
                 assertThat(read(healthy)).isEqualTo("OK");
-                assertThat(read(healthy)).isEqualTo("MSG healthy 0 1 still-working");
+                assertThat(read(healthy)).isEqualTo("MSG slow 2 1 pre2");
+
+                try (Socket publisher = running.connect()) {
+                    socketWrite(publisher, "PUBLISH slow next");
+                    assertThat(read(publisher)).isEqualTo("OK 3");
+                    assertThat(read(healthy)).isEqualTo("MSG slow 3 1 next");
+                    socketWrite(publisher, "PUBLISH slow queued");
+                    assertThat(read(publisher)).isEqualTo("OK 4");
+                }
+                assertThat(slowSocket.isClosed()).isFalse();
+
+                // The two delivery lines plus these two replies fill the small outbound queue.
+                slowSocket.send("WHAT\nWHAT\nACK slow 0 1\n");
+                assertThat(slowClosed.await(5, TimeUnit.SECONDS)).isTrue();
+            }
+
+            BrokerStats.TopicStats released = awaitTopic(running.broker, "slow",
+                    stats -> stats.acked() == 1 && stats.ready() == 4 && stats.inFlight() == 0);
+            assertThat(released.published()).isEqualTo(5);
+            try (Socket second = running.connect()) {
+                socketWrite(second, "SUBSCRIBE slow");
+                assertThat(read(second)).isEqualTo("OK");
+                assertThat(read(second)).isEqualTo("MSG slow 1 2 pre1");
+                assertThat(read(second)).isEqualTo("MSG slow 2 2 pre2");
             }
             slow.close();
         }
     }
 
-    private static BrokerStats.TopicStats awaitSlowClientDisconnect(Broker broker, String topic,
-                                                                     int expectedPublished) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+    @Test
+    void healthySmallWindowConsumerIsNeverDisconnected() throws Exception {
+        int outboundCapacity = 4;
+        BrokerConfig config = new BrokerConfig(60_000,
+                outboundCapacity - MiniqServer.NON_MSG_RESPONSE_RESERVE, 65_536);
+        try (Broker broker = new Broker(Clock.systemUTC(), config);
+             GatedSocket socket = new GatedSocket(false)) {
+            broker.start();
+            AtomicInteger closeCount = new AtomicInteger();
+            ClientConnection healthy = new ClientConnection(broker, config, "healthy-small-window", socket,
+                    closeCount::incrementAndGet, outboundCapacity);
+            healthy.start();
+            socket.send("SUBSCRIBE healthy\n");
+            assertThat(socket.readLine(5, TimeUnit.SECONDS)).isEqualTo("OK");
+
+            for (int i = 0; i < 20; i++) {
+                broker.publish("healthy", "m" + i);
+                assertThat(socket.readLine(5, TimeUnit.SECONDS)).isEqualTo("MSG healthy " + i + " 1 m" + i);
+                socket.send("ACK healthy " + i + " 1\n");
+                assertThat(socket.readLine(5, TimeUnit.SECONDS)).isEqualTo("OK");
+            }
+            assertThat(closeCount.get()).isZero();
+            assertThat(broker.stats().perTopic().get("healthy").acked()).isEqualTo(20);
+            healthy.close();
+        }
+    }
+
+    private static BrokerStats.TopicStats awaitTopic(Broker broker, String topic,
+                                                      java.util.function.Predicate<BrokerStats.TopicStats> ready) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         BrokerStats.TopicStats current;
         do {
             current = broker.stats().perTopic().get(topic);
-            if (current != null && current.published() == expectedPublished
-                    && current.ready() == expectedPublished && current.inFlight() == 0) {
+            if (current != null && ready.test(current)) {
                 return current;
             }
             Thread.onSpinWait();
         } while (System.nanoTime() < deadline);
-        throw new AssertionError("stalled consumer did not disconnect within 20 seconds; topic stats: " + current);
+        throw new AssertionError("timed out waiting for topic state: " + current);
     }
 
     @Test
@@ -304,9 +334,12 @@ class MiniqServerSocketTest {
         final Broker broker;
         final MiniqServer server;
         Running(BrokerConfig config) throws Exception {
+            this(config, ClientConnection.DEFAULT_OUTBOUND_CAPACITY);
+        }
+        Running(BrokerConfig config, int outboundCapacity) throws Exception {
             broker = new Broker(Clock.systemUTC(), config);
             broker.start();
-            server = new MiniqServer(broker, config, 0);
+            server = new MiniqServer(broker, config, 0, outboundCapacity);
             server.start();
         }
         Socket connect() throws Exception {

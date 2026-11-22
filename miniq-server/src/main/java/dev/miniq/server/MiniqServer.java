@@ -13,19 +13,36 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Single-node TCP server for the MiniQ line protocol. The Broker lifecycle remains caller-owned. */
 public final class MiniqServer implements AutoCloseable {
+    static final int NON_MSG_RESPONSE_RESERVE = 2;
     private final Broker broker;
     private final BrokerConfig config;
     private final int requestedPort;
+    private final int outboundCapacity;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Set<ClientConnection> connections = ConcurrentHashMap.newKeySet();
     private volatile ServerSocket serverSocket;
     private volatile Thread acceptThread;
 
     public MiniqServer(Broker broker, BrokerConfig config, int port) {
+        this(broker, config, port, ClientConnection.DEFAULT_OUTBOUND_CAPACITY);
+    }
+
+    MiniqServer(Broker broker, BrokerConfig config, int port, int outboundCapacity) {
         if (port < 0 || port > 65535) throw new IllegalArgumentException("port must be between 0 and 65535");
         this.broker = java.util.Objects.requireNonNull(broker, "broker must not be null");
         this.config = java.util.Objects.requireNonNull(config, "config must not be null");
+        if (outboundCapacity <= NON_MSG_RESPONSE_RESERVE) {
+            throw new IllegalArgumentException("outbound capacity must exceed the non-MSG response reserve of "
+                    + NON_MSG_RESPONSE_RESERVE);
+        }
+        int maxAllowedInFlight = outboundCapacity - NON_MSG_RESPONSE_RESERVE;
+        if (config.maxInFlight() > maxAllowedInFlight) {
+            throw new IllegalArgumentException("maxInFlight " + config.maxInFlight()
+                    + " exceeds outbound capacity " + outboundCapacity + " minus the non-MSG response reserve of "
+                    + NON_MSG_RESPONSE_RESERVE + " (maximum " + maxAllowedInFlight + ")");
+        }
         requestedPort = port;
+        this.outboundCapacity = outboundCapacity;
     }
 
     public synchronized void start() throws IOException {
@@ -50,7 +67,8 @@ public final class MiniqServer implements AutoCloseable {
                 socket.setTcpNoDelay(true);
                 String connectionId = UUID.randomUUID().toString();
                 ClientConnection connection = new ClientConnection(broker, config, connectionId, socket,
-                        () -> connections.removeIf(candidate -> candidate.connectionId().equals(connectionId)));
+                        () -> connections.removeIf(candidate -> candidate.connectionId().equals(connectionId)),
+                        outboundCapacity);
                 connections.add(connection);
                 if (closed.get()) connection.close();
                 else connection.start();
