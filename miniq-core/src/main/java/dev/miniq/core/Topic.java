@@ -116,6 +116,8 @@ public final class Topic {
     void appendAck(long offset, long timestampMillis) {
         lock.lock();
         try {
+            // Keep this pre-check: SegmentWriter rejects bad ACK offsets with IllegalArgumentException,
+            // which FileTopicLog treats as a failed-closed append.
             if (offset < 0 || offset >= nextOffset) {
                 throw new IllegalArgumentException("ACK offset has no preceding PUBLISH: " + offset);
             }

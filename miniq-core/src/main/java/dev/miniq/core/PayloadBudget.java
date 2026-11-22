@@ -28,9 +28,14 @@ final class PayloadBudget {
     }
 
     void release(long bytes) {
-        long remaining = usedBytes.addAndGet(-bytes);
-        if (remaining < 0) {
-            throw new IllegalStateException("payload reservation accounting became negative");
+        while (true) {
+            long current = usedBytes.get();
+            if (bytes < 0 || bytes > current) {
+                throw new IllegalStateException("payload reservation release exceeds the current usage");
+            }
+            if (usedBytes.compareAndSet(current, current - bytes)) {
+                return;
+            }
         }
     }
 

@@ -10,6 +10,7 @@ import java.util.Set;
 
 /** Lazy SegmentWriter adapter for one persistent topic. */
 final class FileTopicLog implements TopicLog {
+    // Mutable fields are not volatile: appends rely on Topic's lock, while close relies on Broker's lifecycle write lock.
     private final Path dataDirectory;
     private final String topicName;
     private final SegmentWriter.Config writerConfig;

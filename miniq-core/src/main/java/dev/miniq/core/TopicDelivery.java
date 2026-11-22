@@ -80,7 +80,13 @@ public final class TopicDelivery {
                 return message;
             } catch (RuntimeException | Error failure) {
                 if (reserved && AppendFailureException.isDefinitelyNotWritten(failure)) {
-                    payloadBudget.release(payloadBytes);
+                    try {
+                        payloadBudget.release(payloadBytes);
+                    } catch (RuntimeException | Error accountingFailure) {
+                        if (accountingFailure != failure) {
+                            failure.addSuppressed(accountingFailure);
+                        }
+                    }
                 }
                 throw failure;
             }

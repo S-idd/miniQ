@@ -28,12 +28,17 @@ public final class AppendFailureException extends IOException {
 
     /** Unclassified failures are ambiguous: preserving a reservation is safer than undercounting disk state. */
     public static boolean isDefinitelyNotWritten(Throwable failure) {
-        for (Throwable current = failure; current != null; current = current.getCause()) {
+        boolean definiteSeen = false;
+        Throwable current = failure;
+        for (int depth = 0; current != null && depth < 32; depth++, current = current.getCause()) {
             if (current instanceof AppendFailureException appendFailure) {
-                return appendFailure.certainty == Certainty.DEFINITE;
+                if (appendFailure.certainty == Certainty.AMBIGUOUS) {
+                    return false;
+                }
+                definiteSeen = true;
             }
         }
-        return false;
+        return current == null && definiteSeen;
     }
 
     public static AppendFailureException definite(String message, Throwable cause) {
