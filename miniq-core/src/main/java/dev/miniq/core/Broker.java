@@ -228,7 +228,19 @@ public final class Broker implements AutoCloseable {
         try {
             ensureOpen();
             Map<String, BrokerStats.TopicStats> perTopic = new TreeMap<>();
-            deliveriesByTopic.forEach((topicName, delivery) -> perTopic.put(topicName, delivery.statsSnapshot()));
+            for (Topic topic : topics.topics()) {
+                String topicName = topic.name();
+                TopicDelivery delivery = deliveriesByTopic.get(topicName);
+                BrokerStats.TopicStats topicStats;
+                if (delivery != null) {
+                    topicStats = delivery.statsSnapshot();
+                } else {
+                    long published = topic.size();
+                    long acked = topic.recoveredAckedOffsets().size();
+                    topicStats = new BrokerStats.TopicStats(published, published - acked, 0, acked, 0);
+                }
+                perTopic.put(topicName, topicStats);
+            }
             long published = 0;
             long ready = 0;
             long inFlight = 0;
