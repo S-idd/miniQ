@@ -82,8 +82,8 @@ public final class SegmentWriter implements AutoCloseable {
         try {
             writer.recoverExistingSegments();
             return writer;
-        } catch (IOException | RuntimeException exception) {
-            OPEN_TOPIC_DIRECTORIES.remove(topicDirectory);
+        } catch (IOException | RuntimeException | Error exception) {
+            writer.cleanupAfterOpenFailure(exception);
             throw exception;
         }
     }
@@ -339,6 +339,20 @@ public final class SegmentWriter implements AutoCloseable {
             closeCurrentSegment();
         } catch (IOException ignored) {
             // Preserve the original append failure.
+        }
+    }
+
+    private void cleanupAfterOpenFailure(Throwable failure) {
+        try {
+            closeCurrentSegment();
+        } catch (IOException closeFailure) {
+            failure.addSuppressed(closeFailure);
+        } finally {
+            currentPath = null;
+            currentSequence = -1;
+            currentSize = 0;
+            currentHasRecords = false;
+            OPEN_TOPIC_DIRECTORIES.remove(topicDirectory);
         }
     }
 

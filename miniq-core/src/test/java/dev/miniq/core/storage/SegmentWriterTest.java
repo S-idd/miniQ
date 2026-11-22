@@ -100,6 +100,46 @@ class SegmentWriterTest {
     }
 
     @Test
+    void failedOpenClosesEarlierSegmentChannelAndReleasesDirectoryLock() throws IOException {
+        java.lang.management.OperatingSystemMXBean bean =
+                java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                bean instanceof com.sun.management.UnixOperatingSystemMXBean,
+                "Unix open file descriptor count is unavailable");
+        com.sun.management.UnixOperatingSystemMXBean unixBean =
+                (com.sun.management.UnixOperatingSystemMXBean) bean;
+        Path dataDir = tempDir.resolve("failed-open-descriptors");
+        Path topicDirectory;
+        try (SegmentWriter writer = SegmentWriter.open(dataDir, "failed-open")) {
+            writer.appendPublish("valid", 1);
+            topicDirectory = writer.topicDirectory();
+        }
+        Path invalidLaterSegment = topicDirectory.resolve(SegmentFormat.fileName(1, 1));
+        byte[] invalidHeader = SegmentFormat.header();
+        invalidHeader[0] = 0;
+        Files.write(invalidLaterSegment, invalidHeader);
+
+        long baseline = unixBean.getOpenFileDescriptorCount();
+        long maximum = baseline;
+        for (int attempt = 0; attempt < 1_000; attempt++) {
+            assertThatThrownBy(() -> SegmentWriter.open(dataDir, "failed-open"))
+                    .isInstanceOf(IOException.class);
+            maximum = Math.max(maximum, unixBean.getOpenFileDescriptorCount());
+        }
+        assertThat(maximum - baseline).isLessThan(100);
+        try (var files = Files.list(topicDirectory)) {
+            assertThat(files.map(path -> path.getFileName().toString()))
+                    .noneMatch(name -> name.endsWith(".lock"));
+        }
+
+        Files.delete(invalidLaterSegment);
+        try (SegmentWriter reopened = SegmentWriter.open(dataDir, "failed-open")) {
+            assertThat(reopened.nextOffset()).isEqualTo(1);
+            assertThat(reopened.appendPublish("repaired", 2)).isEqualTo(1);
+        }
+    }
+
+    @Test
     void recoveryFromPartialHeaderAfterCompleteSegmentStartsFreshSegment() throws IOException {
         Path dataDir = tempDir.resolve("partial-tail-data");
         Path topicDirectory;

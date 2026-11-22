@@ -49,6 +49,26 @@ class StorageRecoveryLimitTest {
     }
 
     @Test
+    void declaredLengthWithinSparseFileButOverLimitIsRejectedBeforeAllocation() throws IOException {
+        Path data = tempDir.resolve("sparse-hostile-length");
+        Path topicDirectory = topicDirectory(data, "sparse-hostile");
+        Files.createDirectories(topicDirectory);
+        Path segment = topicDirectory.resolve(SegmentFormat.fileName(0, 0));
+        try (FileChannel channel = FileChannel.open(segment, StandardOpenOption.CREATE_NEW,
+                StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            channel.write(ByteBuffer.wrap(SegmentFormat.header()));
+            channel.write(ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(268_435_456).flip());
+            channel.position(270L * 1024 * 1024 - 1);
+            channel.write(ByteBuffer.wrap(new byte[]{0}));
+        }
+
+        assertThatThrownBy(() -> StorageRecovery.recover(data))
+                .isInstanceOf(RecoveryException.class)
+                .hasMessageContaining("RECORD_TOO_LARGE")
+                .hasMessageContaining(segment.getFileName().toString());
+    }
+
+    @Test
     void dataWrittenWithLargerMaxLineLimitNeedsThatLimitForRecovery() throws IOException {
         int largerLineLimit = 131_072;
         int payloadLength = RecordCodec.forMaxLineBytes(largerLineLimit).maxPayloadBytes();

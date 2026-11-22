@@ -210,6 +210,9 @@ None currently.
 - Recovery replays PUBLISH records in exact offset order, applies ACKs idempotently, reports unACKed messages as READY, and counts raw UTF-8 payload bytes across topics.
 - `SegmentReader.scanEach` streams validated records through a callback so recovery does not load an entire segment or retain every scanned record; it preserves the Day 14 torn-tail classification.
 - Recovery schedules tail truncation or partial-header deletion only after all topics validate. A failed recovery returns no partial result and leaves files unchanged unless a repair itself fails.
+- Tail repairs remain deferred until every topic validates; recovery descriptor tests sample the maximum open-file count so garbage collection cannot hide leaks.
+- Failed `SegmentWriter.open` closes and clears any current segment state before releasing the per-topic directory reservation, preserving the original open failure.
+- The recovery hostile-length suite runs in a dedicated `-Xmx128m` Surefire fork to enforce the pre-allocation record-length bound.
 - Topic folder names are decoded canonically through `TopicDirectoryNames`; dot-prefixed entries under `topics/` are ignored and other invalid entries fail with their names.
 - Broker wiring, persistence append integration, and delivery-state installation remain deferred to Day 16.
 

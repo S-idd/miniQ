@@ -173,6 +173,94 @@ class StorageRecoveryTest {
     }
 
     @Test
+    void failedValidationAcrossTopicsDoesNotApplyAnyPendingTailRepairs() throws IOException {
+        for (boolean repairFirstTopic : List.of(true, false)) {
+            Path data = tempDir.resolve(repairFirstTopic ? "repair-a-first" : "repair-b-first");
+            Path repairTopic = topicDirectory(data, repairFirstTopic ? "a" : "b");
+            Path invalidTopic = topicDirectory(data, repairFirstTopic ? "b" : "a");
+            Files.createDirectories(repairTopic);
+            Files.createDirectories(invalidTopic);
+            Path repairSegment = segment(repairTopic, 0, 0);
+            Files.write(repairSegment, SegmentFormat.header());
+            Files.write(repairSegment, new byte[]{1, 2}, StandardOpenOption.APPEND);
+            Path invalidSegment = segment(invalidTopic, 0, 0);
+            byte[] firstRecord = new RecordCodec().encode(StorageRecord.publish(0, 1, bytes("bad")));
+            firstRecord[firstRecord.length - 1] ^= 1;
+            byte[] secondRecord = new RecordCodec().encode(StorageRecord.publish(1, 2, bytes("later")));
+            Files.write(invalidSegment, SegmentFormat.header());
+            Files.write(invalidSegment, firstRecord, StandardOpenOption.APPEND);
+            Files.write(invalidSegment, secondRecord, StandardOpenOption.APPEND);
+
+            Map<String, byte[]> before = fileSnapshot(data);
+            assertThatThrownBy(() -> StorageRecovery.recover(data))
+                    .isInstanceOf(RecoveryException.class);
+            assertSnapshotsEqual(before, fileSnapshot(data));
+        }
+    }
+
+    @Test
+    void recoversManyDirectoriesWithoutLeakingSegmentChannels() throws IOException {
+        java.lang.management.OperatingSystemMXBean bean =
+                java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                bean instanceof com.sun.management.UnixOperatingSystemMXBean,
+                "Unix open file descriptor count is unavailable");
+        com.sun.management.UnixOperatingSystemMXBean unixBean =
+                (com.sun.management.UnixOperatingSystemMXBean) bean;
+
+        Path data = tempDir.resolve("descriptor-recovery");
+        try (SegmentWriter writer = SegmentWriter.open(data, "descriptor-topic")) {
+            writer.appendPublish("one", 1);
+            writer.appendPublish("two", 2);
+            writer.appendPublish("three", 3);
+        }
+        long baseline = unixBean.getOpenFileDescriptorCount();
+        long maximum = baseline;
+        for (int iteration = 0; iteration < 1_000; iteration++) {
+            StorageRecovery.recover(data);
+            maximum = Math.max(maximum, unixBean.getOpenFileDescriptorCount());
+        }
+        assertThat(maximum - baseline).isLessThan(100);
+    }
+
+    @Test
+    void zeroByteTailIsRemovedAndWriterStartsFreshSegmentAtRecoveredOffset() throws IOException {
+        Path data = tempDir.resolve("zero-byte-tail");
+        try (SegmentWriter writer = SegmentWriter.open(data, "zero-tail")) {
+            writer.appendPublish("first", 1);
+        }
+        Path topic = topicDirectory(data, "zero-tail");
+        Path emptyTail = segment(topic, 1, 1);
+        Files.createFile(emptyTail);
+
+        assertThat(StorageRecovery.recover(data).topic("zero-tail").nextOffset()).isEqualTo(1);
+        assertThat(emptyTail).doesNotExist();
+        try (SegmentWriter writer = SegmentWriter.open(data, "zero-tail")) {
+            assertThat(writer.nextOffset()).isEqualTo(1);
+            assertThat(writer.appendPublish("second", 2)).isEqualTo(1);
+        }
+        assertThat(StorageRecovery.recover(data).topic("zero-tail").messagesByOffset())
+                .containsEntry(1L, bytes("second"));
+    }
+
+    @Test
+    void onlyZeroByteSegmentIsRemovedAndWriterStartsAtOffsetZero() throws IOException {
+        Path data = tempDir.resolve("only-zero-byte-tail");
+        Path topic = topicDirectory(data, "only-zero");
+        Files.createDirectories(topic);
+        Path empty = segment(topic, 0, 0);
+        Files.createFile(empty);
+
+        assertThat(StorageRecovery.recover(data).topic("only-zero").nextOffset()).isZero();
+        assertThat(empty).doesNotExist();
+        try (SegmentWriter writer = SegmentWriter.open(data, "only-zero")) {
+            assertThat(writer.appendPublish("first", 1)).isZero();
+        }
+        assertThat(StorageRecovery.recover(data).topic("only-zero").messagesByOffset())
+                .containsEntry(0L, bytes("first"));
+    }
+
+    @Test
     void everyLastSegmentByteLengthRecoversAnExactRecordPrefix() throws IOException {
         Path originalData = tempDir.resolve("tail-original");
         try (SegmentWriter writer = SegmentWriter.open(originalData, "tail-topic", new SegmentWriter.Config(
