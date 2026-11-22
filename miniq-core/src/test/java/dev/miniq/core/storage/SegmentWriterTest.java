@@ -17,6 +17,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -281,6 +282,131 @@ class SegmentWriterTest {
         }
         try (SegmentWriter reopened = SegmentWriter.open(dataDir, "single")) {
             assertThat(reopened.nextOffset()).isZero();
+        }
+    }
+
+    @Test
+    void registryUsesRealDirectoryPathAndDoesNotCreateDirectoriesForItsKey() throws IOException {
+        Path realDirectory = tempDir.resolve("real-data");
+        Files.createDirectories(realDirectory);
+        Path alias = tempDir.resolve("alias-data");
+        Files.createSymbolicLink(alias, realDirectory);
+
+        try (SegmentWriter writer = SegmentWriter.open(realDirectory, "real-key")) {
+            assertThatThrownBy(() -> SegmentWriter.open(alias, "real-key"))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("already open");
+            assertThat(writer.topicDirectory()).isEqualTo(realDirectory.resolve("topics")
+                    .resolve(TopicDirectoryNames.forTopic("real-key")));
+        }
+
+        Path lazyDirectory = tempDir.resolve("not-created-for-key");
+        try (SegmentWriter ignored = SegmentWriter.open(lazyDirectory, "lazy")) {
+            assertThat(Files.exists(lazyDirectory)).isFalse();
+        }
+        assertThat(Files.exists(lazyDirectory)).isFalse();
+    }
+
+    @Test
+    void rejectedOpenDoesNotReleaseTheExistingWritersRegistryKey() throws IOException {
+        Path dataDir = tempDir.resolve("rejected-open-data");
+        SegmentWriter owner = SegmentWriter.open(dataDir, "owned");
+        assertThatThrownBy(() -> SegmentWriter.open(dataDir, "owned"))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("already open");
+        assertThatThrownBy(() -> SegmentWriter.open(dataDir, "owned"))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("already open");
+        owner.close();
+        try (SegmentWriter reopened = SegmentWriter.open(dataDir, "owned")) {
+            assertThat(reopened.nextOffset()).isZero();
+        }
+    }
+
+    @Test
+    void closingAnAlreadyClosedWriterCannotReleaseANewerWritersKey() throws IOException {
+        Path dataDir = tempDir.resolve("repeat-close-data");
+        SegmentWriter first = SegmentWriter.open(dataDir, "repeat-close");
+        first.close();
+        SegmentWriter second = SegmentWriter.open(dataDir, "repeat-close");
+
+        first.close();
+        assertThatThrownBy(() -> SegmentWriter.open(dataDir, "repeat-close"))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("already open");
+        second.close();
+        try (SegmentWriter reopened = SegmentWriter.open(dataDir, "repeat-close")) {
+            assertThat(reopened.nextOffset()).isZero();
+        }
+    }
+
+    @Test
+    void failedWriterConstructionReleasesTheRegisteredKey() throws IOException {
+        Path dataDir = tempDir.resolve("constructor-failure-data");
+        assertThatThrownBy(() -> SegmentWriter.open(dataDir, "constructor-failure",
+                SegmentWriter.Config.defaults(), (directory, topics, topic, key, config) -> {
+                    throw new IllegalStateException("injected constructor failure");
+                }))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("injected constructor failure");
+
+        try (SegmentWriter reopened = SegmentWriter.open(dataDir, "constructor-failure")) {
+            assertThat(reopened.nextOffset()).isZero();
+        }
+    }
+
+    @Test
+    void concurrentAppendAndCloseAreSerializedAndLeaveRecoverableRecords() throws Exception {
+        Path dataDir = tempDir.resolve("concurrent-close-data");
+        SegmentWriter writer = SegmentWriter.open(dataDir, "concurrent-close");
+        int threadCount = 8;
+        CountDownLatch ready = new CountDownLatch(threadCount);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicLong successfulAppends = new AtomicLong();
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount + 1);
+        List<Future<?>> workers = new ArrayList<>();
+        try {
+            for (int thread = 0; thread < threadCount; thread++) {
+                int threadId = thread;
+                workers.add(executor.submit(() -> {
+                    ready.countDown();
+                    if (!start.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("start gate timed out");
+                    }
+                    for (int index = 0; index < 500; index++) {
+                        try {
+                            writer.appendPublish(threadId + ":" + index, index);
+                            successfulAppends.incrementAndGet();
+                        } catch (IOException closed) {
+                            assertThat(closed).hasMessageContaining("closed");
+                            break;
+                        }
+                    }
+                    return null;
+                }));
+            }
+            Future<?> close = executor.submit(() -> {
+                if (!start.await(5, TimeUnit.SECONDS)) {
+                    throw new AssertionError("start gate timed out");
+                }
+                writer.close();
+                return null;
+            });
+            assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+            start.countDown();
+            close.get(10, TimeUnit.SECONDS);
+            for (Future<?> worker : workers) {
+                worker.get(10, TimeUnit.SECONDS);
+            }
+        } finally {
+            start.countDown();
+            writer.close();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        }
+
+        try (SegmentWriter recovered = SegmentWriter.open(dataDir, "concurrent-close")) {
+            assertThat(recovered.nextOffset()).isEqualTo(successfulAppends.get());
         }
     }
 

@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Append-only writer for a single topic directory. Calls must be externally serialized. */
 public final class SegmentWriter implements AutoCloseable {
@@ -41,6 +42,7 @@ public final class SegmentWriter implements AutoCloseable {
     private final Path dataDirectory;
     private final Path topicsDirectory;
     private final Path topicDirectory;
+    private final Path registryKey;
     private final Config config;
     private final RecordCodec codec;
     private final Set<Long> ackedOffsets = new HashSet<>();
@@ -52,15 +54,23 @@ public final class SegmentWriter implements AutoCloseable {
     private FileChannel channel;
     private long currentSize;
     private boolean currentHasRecords;
-    private boolean closed;
+    private final AtomicBoolean closed = new AtomicBoolean();
     private boolean failed;
 
-    private SegmentWriter(Path dataDirectory, Path topicsDirectory, Path topicDirectory, Config config) {
+    private SegmentWriter(Path dataDirectory, Path topicsDirectory, Path topicDirectory, Path registryKey,
+                          Config config) {
         this.dataDirectory = dataDirectory;
         this.topicsDirectory = topicsDirectory;
         this.topicDirectory = topicDirectory;
+        this.registryKey = registryKey;
         this.config = config;
         this.codec = new RecordCodec(config.maxRecordBytes());
+    }
+
+    @FunctionalInterface
+    interface WriterFactory {
+        SegmentWriter create(Path dataDirectory, Path topicsDirectory, Path topicDirectory, Path registryKey,
+                             Config config);
     }
 
     /** Opens or creates the writer lazily; a new topic folder and segment appear on its first append. */
@@ -69,21 +79,37 @@ public final class SegmentWriter implements AutoCloseable {
     }
 
     public static SegmentWriter open(Path dataDirectory, String topicName, Config config) throws IOException {
+        return open(dataDirectory, topicName, config, SegmentWriter::new);
+    }
+
+    static SegmentWriter open(Path dataDirectory, String topicName, Config config, WriterFactory writerFactory)
+            throws IOException {
         Objects.requireNonNull(dataDirectory, "dataDirectory must not be null");
         Objects.requireNonNull(config, "config must not be null");
+        Objects.requireNonNull(writerFactory, "writerFactory must not be null");
         String topicFolder = TopicDirectoryNames.forTopic(topicName);
         Path absoluteDataDirectory = dataDirectory.toAbsolutePath().normalize();
         Path topicsDirectory = absoluteDataDirectory.resolve("topics");
         Path topicDirectory = topicsDirectory.resolve(topicFolder);
-        if (!OPEN_TOPIC_DIRECTORIES.add(topicDirectory)) {
-            throw new IOException("a segment writer is already open for topic directory " + topicDirectory);
+        Path registryDataDirectory = Files.exists(dataDirectory)
+                ? dataDirectory.toRealPath()
+                : absoluteDataDirectory;
+        Path registryKey = registryDataDirectory.resolve("topics").resolve(topicFolder);
+        if (!OPEN_TOPIC_DIRECTORIES.add(registryKey)) {
+            throw new IOException("a segment writer is already open for topic directory " + registryKey);
         }
-        SegmentWriter writer = new SegmentWriter(absoluteDataDirectory, topicsDirectory, topicDirectory, config);
+        SegmentWriter writer = null;
         try {
+            writer = writerFactory.create(absoluteDataDirectory, topicsDirectory, topicDirectory, registryKey,
+                    config);
             writer.recoverExistingSegments();
             return writer;
         } catch (IOException | RuntimeException | Error exception) {
-            writer.cleanupAfterOpenFailure(exception);
+            if (writer != null) {
+                writer.cleanupAfterOpenFailure(exception);
+            } else {
+                OPEN_TOPIC_DIRECTORIES.remove(registryKey);
+            }
             throw exception;
         }
     }
@@ -92,11 +118,11 @@ public final class SegmentWriter implements AutoCloseable {
         return topicDirectory;
     }
 
-    public long nextOffset() {
+    public synchronized long nextOffset() {
         return nextOffset;
     }
 
-    public Set<Long> ackedOffsets() {
+    public synchronized Set<Long> ackedOffsets() {
         return Set.copyOf(ackedOffsets);
     }
 
@@ -110,7 +136,7 @@ public final class SegmentWriter implements AutoCloseable {
     }
 
     /** Appends exact UTF-8 PUBLISH payload bytes and returns their assigned topic-local offset. */
-    public long appendPublish(byte[] payload, long timestampMillis) throws IOException {
+    public synchronized long appendPublish(byte[] payload, long timestampMillis) throws IOException {
         Objects.requireNonNull(payload, "payload must not be null");
         ensureWritable();
         if (nextOffset == Long.MAX_VALUE) {
@@ -122,7 +148,7 @@ public final class SegmentWriter implements AutoCloseable {
     }
 
     /** Appends an ACK for a previously published offset; duplicate ACKs are permitted. */
-    public void appendAck(long offset, long timestampMillis) throws IOException {
+    public synchronized void appendAck(long offset, long timestampMillis) throws IOException {
         ensureWritable();
         if (offset < 0 || offset >= nextOffset) {
             throw new IllegalArgumentException("ACK offset has no preceding PUBLISH: " + offset);
@@ -325,7 +351,7 @@ public final class SegmentWriter implements AutoCloseable {
     }
 
     private void ensureWritable() throws IOException {
-        if (closed) {
+        if (closed.get()) {
             throw new IOException("segment writer is closed");
         }
         if (failed) {
@@ -352,7 +378,7 @@ public final class SegmentWriter implements AutoCloseable {
             currentSequence = -1;
             currentSize = 0;
             currentHasRecords = false;
-            OPEN_TOPIC_DIRECTORIES.remove(topicDirectory);
+            OPEN_TOPIC_DIRECTORIES.remove(registryKey);
         }
     }
 
@@ -388,13 +414,12 @@ public final class SegmentWriter implements AutoCloseable {
     }
 
     @Override
-    public void close() throws IOException {
-        if (!closed) {
-            closed = true;
+    public synchronized void close() throws IOException {
+        if (closed.compareAndSet(false, true)) {
             try {
                 closeCurrentSegment();
             } finally {
-                OPEN_TOPIC_DIRECTORIES.remove(topicDirectory);
+                OPEN_TOPIC_DIRECTORIES.remove(registryKey);
             }
         }
     }
