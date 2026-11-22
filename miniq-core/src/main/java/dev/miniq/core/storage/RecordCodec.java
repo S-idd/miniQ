@@ -1,5 +1,7 @@
 package dev.miniq.core.storage;
 
+import dev.miniq.core.Topic;
+
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -10,7 +12,10 @@ import java.util.zip.CRC32;
 public final class RecordCodec {
     public static final int LENGTH_PREFIX_BYTES = 4;
     public static final int FIXED_RECORD_BYTES = 21;
-    public static final int DEFAULT_MAX_PAYLOAD_BYTES = 65_525;
+    // "PUBLISH " + a one-character topic + " \n" is the shortest PUBLISH line overhead.
+    private static final int MIN_PUBLISH_LINE_OVERHEAD_BYTES = 11;
+    public static final int DEFAULT_MAX_PAYLOAD_BYTES =
+            Topic.DEFAULT_MAX_LINE_BYTES - MIN_PUBLISH_LINE_OVERHEAD_BYTES;
     public static final int DEFAULT_MAX_RECORD_BYTES = FIXED_RECORD_BYTES + DEFAULT_MAX_PAYLOAD_BYTES;
 
     public enum Status {
@@ -46,6 +51,19 @@ public final class RecordCodec {
 
     public RecordCodec() {
         this(DEFAULT_MAX_RECORD_BYTES);
+    }
+
+    /** Creates a codec whose payload cap follows the protocol's configured maximum line length. */
+    public static RecordCodec forMaxLineBytes(int maxLineBytes) {
+        if (maxLineBytes < MIN_PUBLISH_LINE_OVERHEAD_BYTES) {
+            throw new IllegalArgumentException("maxLineBytes must be at least "
+                    + MIN_PUBLISH_LINE_OVERHEAD_BYTES);
+        }
+        long maxRecordBytes = (long) FIXED_RECORD_BYTES + maxLineBytes - MIN_PUBLISH_LINE_OVERHEAD_BYTES;
+        if (maxRecordBytes > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("maxLineBytes is too large for a record codec: " + maxLineBytes);
+        }
+        return new RecordCodec((int) maxRecordBytes);
     }
 
     /** maxRecordBytes counts the body after the four-byte length prefix, including CRC. */
