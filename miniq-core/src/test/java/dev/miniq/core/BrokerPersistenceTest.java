@@ -24,6 +24,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -181,6 +182,45 @@ class BrokerPersistenceTest {
             assertThat(accepted).hasValue(5);
             assertThat(rejected).hasValue(5);
             assertThat(broker.payloadBytesUsed()).isEqualTo(100);
+        }
+    }
+
+    @Test
+    void topicAppendsCanOverlapAcrossTopicsAndCloseWaitsForBlockedAppend() throws Exception {
+        BlockingTopicLog blockedA = new BlockingTopicLog();
+        CountingTopicLog logB = new CountingTopicLog();
+        Broker broker = new Broker(new MutableClock(START), BROKER_CONFIG,
+                new PersistenceConfig(tempDir.resolve("lifecycle-read-write"), FsyncMode.NONE, 100),
+                (name, recovered) -> name.equals("a") ? blockedA : logB);
+        ExecutorService executor = Executors.newFixedThreadPool(3);
+        Future<Message> publishA = null;
+        Future<Message> publishB = null;
+        try {
+            publishA = executor.submit(() -> broker.publish("a", "blocked"));
+            assertThat(blockedA.appendStarted.await(2, TimeUnit.SECONDS)).isTrue();
+
+            publishB = executor.submit(() -> broker.publish("b", "independent"));
+            assertThat(publishB.get(2, TimeUnit.SECONDS).offset()).isZero();
+            assertThat(logB.publishCalls.get()).isOne();
+
+            CountDownLatch closeStarted = new CountDownLatch(1);
+            Future<?> closeFuture = executor.submit(() -> {
+                closeStarted.countDown();
+                broker.close();
+                return null;
+            });
+            assertThat(closeStarted.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> closeFuture.get(250, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
+
+            blockedA.allowAppend.countDown();
+            assertThat(publishA.get(2, TimeUnit.SECONDS).offset()).isZero();
+            closeFuture.get(2, TimeUnit.SECONDS);
+        } finally {
+            blockedA.allowAppend.countDown();
+            broker.close();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
         }
     }
 
@@ -439,6 +479,25 @@ class BrokerPersistenceTest {
                 throw new IOException("injected append failure");
             }
             super.appendAck(offset, timestampMillis);
+        }
+    }
+
+    private static final class BlockingTopicLog extends CountingTopicLog {
+        private final CountDownLatch appendStarted = new CountDownLatch(1);
+        private final CountDownLatch allowAppend = new CountDownLatch(1);
+
+        @Override
+        public void appendPublish(long expectedOffset, String payload, long timestampMillis) throws IOException {
+            appendStarted.countDown();
+            try {
+                if (!allowAppend.await(5, TimeUnit.SECONDS)) {
+                    throw new IOException("timed out waiting to unblock topic A append");
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted while waiting to unblock topic A append", interrupted);
+            }
+            super.appendPublish(expectedOffset, payload, timestampMillis);
         }
     }
 }

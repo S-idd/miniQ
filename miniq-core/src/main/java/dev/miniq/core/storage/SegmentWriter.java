@@ -17,7 +17,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Append-only writer for a single topic directory. Calls must be externally serialized. */
+/** Append-only writer for a single topic directory; state access and close serialize on the writer monitor. */
 public final class SegmentWriter implements AutoCloseable {
     public static final long DEFAULT_SEGMENT_SIZE_BYTES = 16L * 1024 * 1024;
     private static final Set<Path> OPEN_TOPIC_DIRECTORIES = ConcurrentHashMap.newKeySet();
@@ -56,6 +56,7 @@ public final class SegmentWriter implements AutoCloseable {
     private boolean currentHasRecords;
     private final AtomicBoolean closed = new AtomicBoolean();
     private boolean failed;
+    private int closeCleanupRuns;
 
     private SegmentWriter(Path dataDirectory, Path topicsDirectory, Path topicDirectory, Path registryKey,
                           Config config) {
@@ -91,6 +92,7 @@ public final class SegmentWriter implements AutoCloseable {
         Path absoluteDataDirectory = dataDirectory.toAbsolutePath().normalize();
         Path topicsDirectory = absoluteDataDirectory.resolve("topics");
         Path topicDirectory = topicsDirectory.resolve(topicFolder);
+        // Existing dirs use their real path; new dirs use an absolute normalized path, so missing-dir symlink aliases differ.
         Path registryDataDirectory = Files.exists(dataDirectory)
                 ? dataDirectory.toRealPath()
                 : absoluteDataDirectory;
@@ -382,6 +384,16 @@ public final class SegmentWriter implements AutoCloseable {
         }
     }
 
+    static int openRegistrySize() {
+        return OPEN_TOPIC_DIRECTORIES.size();
+    }
+
+    int closeCleanupRuns() {
+        synchronized (this) {
+            return closeCleanupRuns;
+        }
+    }
+
     private void closeCurrentSegment() throws IOException {
         FileChannel old = channel;
         channel = null;
@@ -414,12 +426,15 @@ public final class SegmentWriter implements AutoCloseable {
     }
 
     @Override
-    public synchronized void close() throws IOException {
+    public void close() throws IOException {
         if (closed.compareAndSet(false, true)) {
-            try {
-                closeCurrentSegment();
-            } finally {
-                OPEN_TOPIC_DIRECTORIES.remove(registryKey);
+            synchronized (this) {
+                closeCleanupRuns++;
+                try {
+                    closeCurrentSegment();
+                } finally {
+                    OPEN_TOPIC_DIRECTORIES.remove(registryKey);
+                }
             }
         }
     }

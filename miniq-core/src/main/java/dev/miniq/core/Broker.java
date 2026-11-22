@@ -16,6 +16,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import dev.miniq.core.storage.RecoveredTopic;
 import dev.miniq.core.storage.RecoveryException;
 import dev.miniq.core.storage.RecoveryResult;
@@ -37,7 +39,7 @@ public final class Broker implements AutoCloseable {
     private final ConcurrentMap<String, CopyOnWriteArrayList<Subscription>> subscribersByTopic = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, TopicPump> pumpByTopic = new ConcurrentHashMap<>();
     private final Object subscriptionLock = new Object();
-    private final Object lifecycleLock = new Object();
+    private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock(true);
     private final AtomicBoolean closed = new AtomicBoolean();
 
     public Broker(Clock clock, BrokerConfig config) {
@@ -83,9 +85,13 @@ public final class Broker implements AutoCloseable {
 
     /** Starts the broker's single shared daemon timeout worker. */
     public void start() {
-        synchronized (lifecycleLock) {
+        Lock lock = lifecycleLock.readLock();
+        lock.lock();
+        try {
             ensureOpen();
             timeoutScheduler.start();
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -93,7 +99,9 @@ public final class Broker implements AutoCloseable {
     public Message publish(String topic, String payload) {
         TopicDelivery delivery;
         Message message;
-        synchronized (lifecycleLock) {
+        Lock lock = lifecycleLock.readLock();
+        lock.lock();
+        try {
             ensureOpen();
             String validTopic = TopicName.validate(topic);
             if (payload == null) {
@@ -101,6 +109,8 @@ public final class Broker implements AutoCloseable {
             }
             delivery = getOrCreateDelivery(validTopic);
             message = delivery.publish(payload);
+        } finally {
+            lock.unlock();
         }
         pumpTopic(delivery);
         return message;
@@ -112,7 +122,9 @@ public final class Broker implements AutoCloseable {
 
     /** Registers at most one inactive topic subscription for this connection. */
     public SubscribeResult subscribe(String connectionId, String topic, long ackTimeoutMs, DeliverySink sink) {
-        synchronized (lifecycleLock) {
+        Lock lock = lifecycleLock.readLock();
+        lock.lock();
+        try {
             ensureOpen();
             Objects.requireNonNull(connectionId, "connectionId must not be null");
             Objects.requireNonNull(sink, "sink must not be null");
@@ -129,6 +141,8 @@ public final class Broker implements AutoCloseable {
                 subscriptionsByConnection.put(connectionId, subscription);
                 subscribersByTopic.computeIfAbsent(validTopic, ignored -> new CopyOnWriteArrayList<>()).add(subscription);
             }
+        } finally {
+            lock.unlock();
         }
         return SubscribeResult.OK;
     }
@@ -136,7 +150,9 @@ public final class Broker implements AutoCloseable {
     /** Activates a registered subscription after its SUBSCRIBE reply has been written. */
     public void startDelivery(String connectionId) {
         Subscription subscription;
-        synchronized (lifecycleLock) {
+        Lock lock = lifecycleLock.readLock();
+        lock.lock();
+        try {
             ensureOpen();
             Objects.requireNonNull(connectionId, "connectionId must not be null");
             subscription = subscriptionsByConnection.get(connectionId);
@@ -144,6 +160,8 @@ public final class Broker implements AutoCloseable {
                 return;
             }
             subscription.active = true;
+        } finally {
+            lock.unlock();
         }
         pumpTopic(subscription.delivery);
     }
@@ -152,7 +170,9 @@ public final class Broker implements AutoCloseable {
     public AckResult ack(String connectionId, String topic, long offset, int deliveryCount) {
         Subscription subscription;
         AckResult result;
-        synchronized (lifecycleLock) {
+        Lock lock = lifecycleLock.readLock();
+        lock.lock();
+        try {
             ensureOpen();
             Objects.requireNonNull(connectionId, "connectionId must not be null");
             String validTopic = TopicName.validate(topic);
@@ -162,6 +182,8 @@ public final class Broker implements AutoCloseable {
             }
 
             result = subscription.delivery.ack(connectionId, offset, deliveryCount);
+        } finally {
+            lock.unlock();
         }
         if (result == AckResult.ACKED) {
             pumpTopic(subscription.delivery);
@@ -172,7 +194,9 @@ public final class Broker implements AutoCloseable {
     /** Releases the connection's active subscription and pumps its returned messages elsewhere. */
     public void disconnect(String connectionId) {
         Subscription subscription;
-        synchronized (lifecycleLock) {
+        Lock lock = lifecycleLock.readLock();
+        lock.lock();
+        try {
             ensureOpen();
             Objects.requireNonNull(connectionId, "connectionId must not be null");
             synchronized (subscriptionLock) {
@@ -185,6 +209,8 @@ public final class Broker implements AutoCloseable {
                     subscription.delivery.release(connectionId);
                 }
             }
+        } finally {
+            lock.unlock();
         }
         if (subscription != null) {
             pumpTopic(subscription.delivery);
@@ -193,7 +219,9 @@ public final class Broker implements AutoCloseable {
 
     /** Returns an immutable per-topic stats snapshot; concurrent topics are captured independently. */
     public BrokerStats stats() {
-        synchronized (lifecycleLock) {
+        Lock lock = lifecycleLock.readLock();
+        lock.lock();
+        try {
             ensureOpen();
             Map<String, BrokerStats.TopicStats> perTopic = new TreeMap<>();
             deliveriesByTopic.forEach((topicName, delivery) -> perTopic.put(topicName, delivery.statsSnapshot()));
@@ -210,12 +238,16 @@ public final class Broker implements AutoCloseable {
                 redeliveries += topicStats.redeliveries();
             }
             return new BrokerStats(published, ready, inFlight, acked, redeliveries, perTopic);
+        } finally {
+            lock.unlock();
         }
     }
 
     @Override
     public void close() {
-        synchronized (lifecycleLock) {
+        Lock writeLock = lifecycleLock.writeLock();
+        writeLock.lock();
+        try {
             if (!closed.compareAndSet(false, true)) {
                 return;
             }
@@ -227,6 +259,8 @@ public final class Broker implements AutoCloseable {
                     subscription.delivery.release(subscription.connectionId);
                 }
             }
+        } finally {
+            writeLock.unlock();
         }
         RuntimeException failure = null;
         try {
@@ -234,7 +268,8 @@ public final class Broker implements AutoCloseable {
         } catch (RuntimeException closeFailure) {
             failure = closeFailure;
         }
-        synchronized (lifecycleLock) {
+        writeLock.lock();
+        try {
             for (Topic topic : topics.topics()) {
                 try {
                     topic.closeLog();
@@ -246,6 +281,8 @@ public final class Broker implements AutoCloseable {
                     }
                 }
             }
+        } finally {
+            writeLock.unlock();
         }
         if (failure != null) {
             throw failure;

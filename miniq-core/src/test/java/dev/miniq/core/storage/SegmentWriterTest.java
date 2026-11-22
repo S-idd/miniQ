@@ -291,11 +291,16 @@ class SegmentWriterTest {
         Files.createDirectories(realDirectory);
         Path alias = tempDir.resolve("alias-data");
         Files.createSymbolicLink(alias, realDirectory);
+        Path relative = Path.of("").toAbsolutePath().relativize(realDirectory);
+        Path dotAlias = Path.of(realDirectory + "/./");
+        Path parentAlias = Path.of(realDirectory + "/../" + realDirectory.getFileName());
 
         try (SegmentWriter writer = SegmentWriter.open(realDirectory, "real-key")) {
-            assertThatThrownBy(() -> SegmentWriter.open(alias, "real-key"))
-                    .isInstanceOf(IOException.class)
-                    .hasMessageContaining("already open");
+            for (Path sameDirectory : List.of(relative, realDirectory.toAbsolutePath(), dotAlias, parentAlias, alias)) {
+                assertThatThrownBy(() -> SegmentWriter.open(sameDirectory, "real-key"))
+                        .isInstanceOf(IOException.class)
+                        .hasMessageContaining("already open");
+            }
             assertThat(writer.topicDirectory()).isEqualTo(realDirectory.resolve("topics")
                     .resolve(TopicDirectoryNames.forTopic("real-key")));
         }
@@ -408,6 +413,58 @@ class SegmentWriterTest {
         try (SegmentWriter recovered = SegmentWriter.open(dataDir, "concurrent-close")) {
             assertThat(recovered.nextOffset()).isEqualTo(successfulAppends.get());
         }
+    }
+
+    @Test
+    void sixteenConcurrentCloseCallsRunCleanupOnceAndAllowReopen() throws Exception {
+        Path dataDir = tempDir.resolve("concurrent-many-close-data");
+        int threadCount = 16;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        try {
+            for (int cycle = 0; cycle < 50; cycle++) {
+                SegmentWriter writer = SegmentWriter.open(dataDir, "concurrent-many-close");
+                CountDownLatch ready = new CountDownLatch(threadCount);
+                CountDownLatch start = new CountDownLatch(1);
+                List<Future<?>> closes = new ArrayList<>();
+                for (int index = 0; index < threadCount; index++) {
+                    closes.add(executor.submit(() -> {
+                        ready.countDown();
+                        if (!start.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("close start gate timed out");
+                        }
+                        writer.close();
+                        return null;
+                    }));
+                }
+                assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+                start.countDown();
+                for (Future<?> close : closes) {
+                    close.get(5, TimeUnit.SECONDS);
+                }
+                assertThat(writer.closeCleanupRuns()).isOne();
+                assertThat(SegmentWriter.openRegistrySize()).isZero();
+            }
+        } finally {
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        }
+
+        assertThat(SegmentWriter.openRegistrySize()).isZero();
+        try (SegmentWriter reopened = SegmentWriter.open(dataDir, "concurrent-many-close")) {
+            assertThat(reopened.nextOffset()).isZero();
+        }
+    }
+
+    @Test
+    void oneThousandOpenCloseCyclesLeaveTheRegistryEmpty() throws IOException {
+        Path dataDir = tempDir.resolve("registry-cycle-data");
+        assertThat(SegmentWriter.openRegistrySize()).isZero();
+        for (int iteration = 0; iteration < 1_000; iteration++) {
+            try (SegmentWriter ignored = SegmentWriter.open(dataDir, "cycles")) {
+                assertThat(SegmentWriter.openRegistrySize()).isOne();
+            }
+        }
+        assertThat(SegmentWriter.openRegistrySize()).isZero();
     }
 
     private static List<String> fileNames(Path directory) throws IOException {
