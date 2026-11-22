@@ -4,12 +4,14 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -42,6 +44,55 @@ class TopicDeliveryTest {
         delivery.checkInvariants();
         assertThat(delivery.deliverNext("consumer")).isEmpty();
         delivery.checkInvariants();
+    }
+
+    @Test
+    void reservationReleaseFailureIsSuppressedOnOriginalAppendFailure() throws Exception {
+        CountDownLatch appendEntered = new CountDownLatch(1);
+        CountDownLatch failAppend = new CountDownLatch(1);
+        TopicLog log = new TopicLog() {
+            @Override
+            public void appendPublish(long expectedOffset, String payload, long timestampMillis) throws IOException {
+                appendEntered.countDown();
+                try {
+                    if (!failAppend.await(5, TimeUnit.SECONDS)) {
+                        throw new IOException("append failure gate timed out");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted", interrupted);
+                }
+                throw AppendFailureException.definite("injected definite append failure");
+            }
+
+            @Override
+            public void appendAck(long offset, long timestampMillis) {
+            }
+        };
+        PayloadBudget budget = new PayloadBudget(10, 0);
+        TopicDelivery delivery = new TopicDelivery(new Topic("orders", Topic.DEFAULT_MAX_LINE_BYTES, log),
+                new MutableClock(START), (topic, offset, count, deadline) -> { }, budget);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> publish = executor.submit(() -> delivery.publish("x"));
+            assertThat(appendEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            budget.release(1);
+            failAppend.countDown();
+
+            assertThatThrownBy(() -> publish.get(5, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .satisfies(failure -> {
+                        Throwable original = failure.getCause();
+                        assertThat(original).isInstanceOf(StorageException.class);
+                        assertThat(original.getSuppressed()).hasSize(1);
+                        assertThat(original.getSuppressed()[0]).isInstanceOf(IllegalStateException.class);
+                    });
+            assertThat(budget.usedBytes()).isZero();
+        } finally {
+            failAppend.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        }
     }
 
     @Test

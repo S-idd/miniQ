@@ -23,6 +23,12 @@
 - [x] Day 13 persistence design review: clarified fail-closed recovery over the 256 MiB payload cap, bounded record allocation, cross-topic atomic payload reservations, fsync-mode consistency, and same-PR Day 16 protocol error documentation
 - [x] Day 14: JDK-only record codec, segment reader/writer, CRC and torn-tail validation, partial-header recovery, full-segment byte-flip coverage, rolling/reopen, and storage tests; broker integration remains for Day 16
 - [x] Day 15: plain-data startup recovery, topic-folder decoding, ACK/READY reconstruction, sequence and offset validation, deferred torn-tail repair, channel cleanup, zero-byte-tail and hostile-length regression coverage; broker integration remains for Day 16
+- [x] Day 16a: opt-in core persistence for publishes and ACKs, restart restoration of offsets/delivery state, shared UTF-8 payload cap, and broker lifecycle integration
+- [x] Day 16a follow-up: canonical SegmentWriter registry keys, single-owner close cleanup, and concurrent cross-topic persistence under lifecycle read/write locking
+- [x] Day 16a append-failure follow-up: classify definite versus ambiguous writes, preserve cap reservations for uncertain records, and fail the affected topic closed
+- [x] Day 16a PR #4 fix: ambiguous append failures keep payload bytes charged and fail the topic closed; definite pre-write failures release the reservation
+- [x] Day 16a hardening follow-up: bound append-failure cause inspection, validate payload releases atomically, and preserve append errors when reservation cleanup fails
+- [ ] Day 16b: PAYLOAD_LIMIT protocol error (ProtocolErrorCode, ClientConnection mapping for PayloadLimitException, docs/PROTOCOL.md error-table row, socket-level test that a publish over the cap returns ERR PAYLOAD_LIMIT)
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
 - [ ] Days 18–21: Spring Boot starter and demo apps
 - [ ] Days 22–23: Benchmark and optional @EmbeddedMiniQ

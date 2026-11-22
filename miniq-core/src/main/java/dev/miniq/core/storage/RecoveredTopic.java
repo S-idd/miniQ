@@ -12,16 +12,18 @@ public final class RecoveredTopic {
     private final String name;
     private final long nextOffset;
     private final Map<Long, byte[]> messagesByOffset;
+    private final Map<Long, Long> publishedAtMillisByOffset;
     private final Set<Long> ackedOffsets;
     private final long payloadBytes;
 
     RecoveredTopic(String name, long nextOffset, Map<Long, byte[]> messagesByOffset,
-                   Set<Long> ackedOffsets, long payloadBytes) {
+                   Map<Long, Long> publishedAtMillisByOffset, Set<Long> ackedOffsets, long payloadBytes) {
         this.name = Objects.requireNonNull(name, "name must not be null");
         this.nextOffset = nextOffset;
         Map<Long, byte[]> copied = new LinkedHashMap<>();
         messagesByOffset.forEach((offset, payload) -> copied.put(offset, payload.clone()));
         this.messagesByOffset = Collections.unmodifiableMap(copied);
+        this.publishedAtMillisByOffset = Collections.unmodifiableMap(new LinkedHashMap<>(publishedAtMillisByOffset));
         this.ackedOffsets = Collections.unmodifiableSet(new LinkedHashSet<>(ackedOffsets));
         this.payloadBytes = payloadBytes;
     }
@@ -43,6 +45,10 @@ public final class RecoveredTopic {
 
     public Set<Long> ackedOffsets() {
         return ackedOffsets;
+    }
+
+    public Map<Long, Long> publishedAtMillisByOffset() {
+        return publishedAtMillisByOffset;
     }
 
     /** Returns READY payloads, excluding all offsets in {@link #ackedOffsets()}. */
@@ -70,6 +76,7 @@ public final class RecoveredTopic {
                 || nextOffset != that.nextOffset
                 || payloadBytes != that.payloadBytes
                 || !ackedOffsets.equals(that.ackedOffsets)
+                || !publishedAtMillisByOffset.equals(that.publishedAtMillisByOffset)
                 || !messagesByOffset.keySet().equals(that.messagesByOffset.keySet())) {
             return false;
         }
@@ -79,7 +86,7 @@ public final class RecoveredTopic {
 
     @Override
     public int hashCode() {
-        int result = Objects.hash(name, nextOffset, ackedOffsets, payloadBytes);
+        int result = Objects.hash(name, nextOffset, publishedAtMillisByOffset, ackedOffsets, payloadBytes);
         for (Map.Entry<Long, byte[]> entry : messagesByOffset.entrySet()) {
             result = 31 * result + Objects.hash(entry.getKey(), java.util.Arrays.hashCode(entry.getValue()));
         }

@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.nio.charset.StandardCharsets;
 import java.util.TreeSet;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -23,6 +24,7 @@ public final class TopicDelivery {
     private final Topic topic;
     private final Clock clock;
     private final DeadlineListener deadlineListener;
+    private final PayloadBudget payloadBudget;
     private volatile RuntimeException lastDeadlineListenerFailure;
     private final ReentrantLock lock = new ReentrantLock();
     // Redelivered offsets rejoin READY; selection always takes the lowest offset, not retry priority.
@@ -42,23 +44,52 @@ public final class TopicDelivery {
     }
 
     public TopicDelivery(Topic topic, Clock clock, DeadlineListener deadlineListener) {
+        this(topic, clock, deadlineListener, null);
+    }
+
+    TopicDelivery(Topic topic, Clock clock, DeadlineListener deadlineListener, PayloadBudget payloadBudget) {
         this.topic = Objects.requireNonNull(topic, "topic must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
         this.deadlineListener = Objects.requireNonNull(deadlineListener, "deadlineListener must not be null");
+        this.payloadBudget = payloadBudget;
+        Set<Long> recoveredAckedOffsets = topic.recoveredAckedOffsets();
         for (long offset = 0; offset < topic.nextOffset(); offset++) {
             if (topic.get(offset).isEmpty()) {
                 throw new IllegalStateException("topic log is missing offset " + offset);
             }
-            readyOffsets.add(offset);
+            if (recoveredAckedOffsets.contains(offset)) {
+                ackedOffsets.add(offset);
+            } else {
+                readyOffsets.add(offset);
+            }
         }
     }
 
     public Message publish(String payload) {
+        topic.validatePayloadForPublish(payload);
+        long payloadBytes = payload.getBytes(StandardCharsets.UTF_8).length;
         lock.lock();
         try {
-            Message message = topic.publish(payload);
-            readyOffsets.add(message.offset());
-            return message;
+            boolean reserved = payloadBudget != null;
+            if (reserved) {
+                payloadBudget.reserve(payloadBytes);
+            }
+            try {
+                Message message = topic.publish(payload);
+                readyOffsets.add(message.offset());
+                return message;
+            } catch (RuntimeException | Error failure) {
+                if (reserved && AppendFailureException.isDefinitelyNotWritten(failure)) {
+                    try {
+                        payloadBudget.release(payloadBytes);
+                    } catch (RuntimeException | Error accountingFailure) {
+                        if (accountingFailure != failure) {
+                            failure.addSuppressed(accountingFailure);
+                        }
+                    }
+                }
+                throw failure;
+            }
         } finally {
             lock.unlock();
         }
@@ -204,6 +235,7 @@ public final class TopicDelivery {
                 return AckResult.NOT_IN_FLIGHT;
             }
 
+            topic.appendAck(offset, clock.millis());
             inFlightByOffset.remove(offset);
             subscribers.get(current.subscriberId).inFlightOffsets.remove(offset);
             ackedOffsets.add(offset);
