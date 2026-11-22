@@ -245,3 +245,10 @@ Offsets are gapless and monotonic per topic. Competing subscribers hold at most 
 ### Known limitations
 
 The broker is single-process and in-memory; restart loses messages and ACK state. There is no networking, protocol parser, persistence, auth, UI, or consumer groups. A slow sink can stall the caller thread that invokes it; server sinks must enqueue quickly to a separate outbound writer. Delivery and ACK bookkeeping grows with the number of published offsets for the life of the process.
+
+## Implementation notes (Day 16b)
+
+- Persistence remains opt-in: without `--data-dir`, startup uses the in-memory Broker constructor. With the option, the server constructs `PersistenceConfig` before starting the listener, so recovery failures cannot emit `MINIQ_READY`.
+- Recovery counts are exposed as an immutable `RecoveryStats` snapshot so the server can report startup recovery without scanning or reimplementing the storage format.
+- `--fsync` accepts only `NONE` and `EVERY_WRITE`, defaults to `NONE`, and requires `--data-dir`. The shutdown hook closes the listener and client connections before closing the broker and its topic writers.
+- Wire storage failures use a fixed `SERVER_ERROR` message and are logged server-side with their cause; payload-cap failures use `PAYLOAD_LIMIT`. Both errors leave the connection available for later commands.

@@ -2,14 +2,18 @@ package dev.miniq.server;
 
 import dev.miniq.core.Broker;
 import dev.miniq.core.BrokerConfig;
+import dev.miniq.core.PersistenceConfig;
+import dev.miniq.core.storage.FsyncMode;
 
+import java.nio.file.Path;
 import java.time.Clock;
 import java.util.concurrent.CountDownLatch;
 
 /** Command-line entry point for the local in-memory MiniQ server. */
 public final class MiniQServerMain {
     private static final String USAGE = "Usage: MiniQServerMain [--port <0..65535>] "
-            + "[--ack-timeout-ms <100..300000>] [--max-in-flight <positive>]";
+            + "[--ack-timeout-ms <100..300000>] [--max-in-flight <positive>] "
+            + "[--data-dir <path>] [--fsync NONE|EVERY_WRITE]";
 
     private MiniQServerMain() { }
 
@@ -26,22 +30,30 @@ public final class MiniQServerMain {
 
         BrokerConfig config = new BrokerConfig(options.ackTimeoutMs(), options.maxInFlight(),
                 BrokerConfig.DEFAULT_MAX_LINE_BYTES);
-        Broker broker = new Broker(Clock.systemUTC(), config);
-        MiniqServer server = new MiniqServer(broker, config, options.port());
+        Broker broker = null;
+        MiniqServer server = null;
         try {
+            broker = options.dataDirectory() == null
+                    ? new Broker(Clock.systemUTC(), config)
+                    : new Broker(Clock.systemUTC(), config, persistenceConfig(options));
+            var recovered = broker.recoveryStats();
+            System.err.println("Recovered " + recovered.topicCount() + " topics and "
+                    + recovered.messageCount() + " messages");
+            server = new MiniqServer(broker, config, options.port());
             broker.start();
             server.start();
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                server.close();
-                broker.close();
-            }, "miniq-shutdown"));
+            Broker runningBroker = broker;
+            MiniqServer runningServer = server;
+            Runtime.getRuntime().addShutdownHook(shutdownHook(runningServer, runningBroker));
             System.out.println("MINIQ_READY port=" + server.port());
             System.out.flush();
             new CountDownLatch(1).await();
         } catch (Exception failure) {
-            System.err.println("MiniQ server failed: " + failure.getMessage());
-            server.close();
-            broker.close();
+            String cause = failure.getMessage();
+            if (cause == null || cause.isBlank()) cause = failure.getClass().getSimpleName();
+            System.err.println("MiniQ server failed: " + cause.replace('\n', ' ').replace('\r', ' '));
+            try { if (server != null) server.close(); } catch (RuntimeException ignored) { }
+            try { if (broker != null) broker.close(); } catch (RuntimeException ignored) { }
             System.exit(1);
         }
     }
@@ -50,6 +62,9 @@ public final class MiniQServerMain {
         int port = 7070;
         long ackTimeoutMs = 5_000;
         int maxInFlight = 16;
+        Path dataDirectory = null;
+        FsyncMode fsyncMode = FsyncMode.NONE;
+        boolean fsyncSpecified = false;
         for (int i = 0; i < args.length; i++) {
             String name = args[i];
             if (i + 1 >= args.length) throw new IllegalArgumentException("Missing value for " + name);
@@ -70,14 +85,41 @@ public final class MiniQServerMain {
                         maxInFlight = Integer.parseInt(value);
                         if (maxInFlight < 1) throw new IllegalArgumentException("--max-in-flight must be positive");
                     }
+                    case "--data-dir" -> dataDirectory = Path.of(value);
+                    case "--fsync" -> {
+                        fsyncSpecified = true;
+                        try {
+                            fsyncMode = FsyncMode.valueOf(value);
+                        } catch (IllegalArgumentException invalidMode) {
+                            throw new IllegalArgumentException("--fsync must be NONE or EVERY_WRITE");
+                        }
+                    }
                     default -> throw new IllegalArgumentException("Unknown argument: " + name);
                 }
             } catch (NumberFormatException badNumber) {
                 throw new IllegalArgumentException("Invalid number for " + name + ": " + value, badNumber);
             }
         }
-        return new Options(port, ackTimeoutMs, maxInFlight);
+        if (dataDirectory == null && fsyncSpecified) {
+            throw new IllegalArgumentException("--fsync requires --data-dir");
+        }
+        return new Options(port, ackTimeoutMs, maxInFlight, dataDirectory, fsyncMode);
     }
 
-    record Options(int port, long ackTimeoutMs, int maxInFlight) { }
+    static PersistenceConfig persistenceConfig(Options options) {
+        return new PersistenceConfig(options.dataDirectory(), options.fsyncMode());
+    }
+
+    static Thread shutdownHook(MiniqServer server, Broker broker) {
+        return new Thread(() -> {
+            server.close();
+            broker.close();
+        }, "miniq-shutdown");
+    }
+
+    record Options(int port, long ackTimeoutMs, int maxInFlight, Path dataDirectory, FsyncMode fsyncMode) {
+        Options(int port, long ackTimeoutMs, int maxInFlight) {
+            this(port, ackTimeoutMs, maxInFlight, null, FsyncMode.NONE);
+        }
+    }
 }

@@ -11,5 +11,6 @@ public enum ProtocolErrorCode {
     ALREADY_SUBSCRIBED,
     NOT_SUBSCRIBED,
     ACK_NOT_IN_FLIGHT,
+    PAYLOAD_LIMIT,
     SERVER_ERROR
 }
