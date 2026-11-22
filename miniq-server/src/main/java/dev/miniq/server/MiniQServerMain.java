@@ -33,18 +33,19 @@ public final class MiniQServerMain {
         Broker broker = null;
         MiniqServer server = null;
         try {
-            broker = options.dataDirectory() == null
+            PersistenceConfig persistenceConfig = persistenceConfig(options);
+            broker = persistenceConfig == null
                     ? new Broker(Clock.systemUTC(), config)
-                    : new Broker(Clock.systemUTC(), config, persistenceConfig(options));
+                    : new Broker(Clock.systemUTC(), config, persistenceConfig);
             var recovered = broker.recoveryStats();
             System.err.println("Recovered " + recovered.topicCount() + " topics and "
                     + recovered.messageCount() + " messages");
             server = new MiniqServer(broker, config, options.port());
-            broker.start();
-            server.start();
             Broker runningBroker = broker;
             MiniqServer runningServer = server;
             Runtime.getRuntime().addShutdownHook(shutdownHook(runningServer, runningBroker));
+            broker.start();
+            server.start();
             System.out.println("MINIQ_READY port=" + server.port());
             System.out.flush();
             new CountDownLatch(1).await();
@@ -107,14 +108,23 @@ public final class MiniQServerMain {
     }
 
     static PersistenceConfig persistenceConfig(Options options) {
-        return new PersistenceConfig(options.dataDirectory(), options.fsyncMode());
+        return options.dataDirectory() == null
+                ? null
+                : new PersistenceConfig(options.dataDirectory(), options.fsyncMode());
     }
 
     static Thread shutdownHook(MiniqServer server, Broker broker) {
-        return new Thread(() -> {
-            server.close();
-            broker.close();
-        }, "miniq-shutdown");
+        return new Thread(shutdownAction(server::close, broker::close), "miniq-shutdown");
+    }
+
+    static Runnable shutdownAction(Runnable closeServer, Runnable closeBroker) {
+        return () -> {
+            try {
+                closeServer.run();
+            } finally {
+                closeBroker.run();
+            }
+        };
     }
 
     record Options(int port, long ackTimeoutMs, int maxInFlight, Path dataDirectory, FsyncMode fsyncMode) {

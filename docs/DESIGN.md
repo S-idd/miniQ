@@ -252,3 +252,5 @@ The broker is single-process and in-memory; restart loses messages and ACK state
 - Recovery counts are exposed as an immutable `RecoveryStats` snapshot so the server can report startup recovery without scanning or reimplementing the storage format.
 - `--fsync` accepts only `NONE` and `EVERY_WRITE`, defaults to `NONE`, and requires `--data-dir`. The shutdown hook closes the listener and client connections before closing the broker and its topic writers.
 - Wire storage failures use a fixed `SERVER_ERROR` message and are logged server-side with their cause; payload-cap failures use `PAYLOAD_LIMIT`. Both errors leave the connection available for later commands.
+- Recovered topics appear in broker stats before their delivery state is initialized; their ready and ACKED counts come from the recovered log.
+- Redelivery counts are in-memory only and reset to zero after broker restart, because delivery attempts are not persisted.
