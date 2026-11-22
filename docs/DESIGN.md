@@ -216,6 +216,12 @@ None currently.
 - Topic folder names are decoded canonically through `TopicDirectoryNames`; dot-prefixed entries under `topics/` are ignored and other invalid entries fail with their names.
 - Broker wiring, persistence append integration, and delivery-state installation remain deferred to Day 16.
 
+## Implementation notes (Day 16a)
+
+- Persistence is opt-in through `PersistenceConfig`; the existing `Broker(Clock, BrokerConfig)` constructor stays in-memory and uses a no-op `TopicLog`.
+- Topic logs append before offsets or delivery state advance. Recovery installs messages and ACKed offsets before subscriptions start; a shared byte budget reserves UTF-8 payload bytes across topics and releases them when append fails.
+- The broker closes topic logs with its timeout scheduler. Per-topic file logs open lazily, use the Day 14 segment writer, and apply the configured fsync mode.
+
 ## Core API summary
 
 ### Public methods

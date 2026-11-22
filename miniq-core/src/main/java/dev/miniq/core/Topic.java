@@ -5,6 +5,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.io.IOException;
+import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 
 /** An in-memory append-only topic log. */
@@ -13,6 +15,7 @@ public final class Topic {
 
     private final String name;
     private final int maxLineBytes;
+    private final TopicLog log;
     // Invariant: offsets are gapless and strictly increasing.
     private final List<Message> messages = new ArrayList<>();
     private final ReentrantLock lock = new ReentrantLock();
@@ -27,6 +30,14 @@ public final class Topic {
      * may not exceed {@code maxLineBytes} UTF-8 bytes.
      */
     public Topic(String name, int maxLineBytes) {
+        this(name, maxLineBytes, new InMemoryTopicLog());
+    }
+
+    Topic(String name, int maxLineBytes, TopicLog log) {
+        this(name, maxLineBytes, log, List.of());
+    }
+
+    Topic(String name, int maxLineBytes, TopicLog log, List<Message> recoveredMessages) {
         this.name = TopicName.validate(name);
         int emptyPublishLineBytes = publishHeaderBytes() + 1;
         if (maxLineBytes < emptyPublishLineBytes) {
@@ -35,6 +46,15 @@ public final class Topic {
                             + emptyPublishLineBytes + ")");
         }
         this.maxLineBytes = maxLineBytes;
+        this.log = Objects.requireNonNull(log, "log must not be null");
+        Objects.requireNonNull(recoveredMessages, "recoveredMessages must not be null");
+        for (Message message : recoveredMessages) {
+            if (!message.topic().equals(this.name) || message.offset() != nextOffset) {
+                throw new IllegalArgumentException("recovered messages must match the topic and have gapless offsets");
+            }
+            messages.add(message);
+            nextOffset++;
+        }
     }
 
     public Message publish(String payload) {
@@ -45,6 +65,7 @@ public final class Topic {
         try {
             long followingOffset = Math.incrementExact(nextOffset);
             Message message = new Message(name, nextOffset, payload, System.currentTimeMillis());
+            appendPublish(message);
             messages.add(message);
             nextOffset = followingOffset;
             return message;
@@ -85,6 +106,48 @@ public final class Topic {
 
     public String name() {
         return name;
+    }
+
+    void validatePayloadForPublish(String payload) {
+        Objects.requireNonNull(payload, "payload must not be null");
+        validatePayload(payload);
+    }
+
+    void appendAck(long offset, long timestampMillis) {
+        lock.lock();
+        try {
+            if (offset < 0 || offset >= nextOffset) {
+                throw new IllegalArgumentException("ACK offset has no preceding PUBLISH: " + offset);
+            }
+            try {
+                log.appendAck(offset, timestampMillis);
+            } catch (IOException exception) {
+                throw new StorageException("could not append ACK for topic " + name + " offset " + offset, exception);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    Set<Long> recoveredAckedOffsets() {
+        return log.recoveredAckedOffsets();
+    }
+
+    void closeLog() {
+        try {
+            log.close();
+        } catch (IOException exception) {
+            throw new StorageException("could not close topic log for " + name, exception);
+        }
+    }
+
+    private void appendPublish(Message message) {
+        try {
+            log.appendPublish(message.offset(), message.payload(), message.publishedAtMillis());
+        } catch (IOException exception) {
+            throw new StorageException("could not append PUBLISH for topic " + name
+                    + " offset " + message.offset(), exception);
+        }
     }
 
     private void validatePayload(String payload) {

@@ -4,6 +4,10 @@ import dev.miniq.core.Topic;
 
 import java.io.IOException;
 import java.nio.channels.FileChannel;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -22,9 +26,11 @@ public final class StorageRecovery {
     public static final long MAX_RECOVERED_PAYLOAD_BYTES = 268_435_456L;
 
     private final RecordCodec codec;
+    private final long payloadCapBytes;
 
-    private StorageRecovery(RecordCodec codec) {
+    private StorageRecovery(RecordCodec codec, long payloadCapBytes) {
         this.codec = codec;
+        this.payloadCapBytes = payloadCapBytes;
     }
 
     /** Recovers data from the writer's {@code dataDirectory/topics} layout. */
@@ -34,7 +40,16 @@ public final class StorageRecovery {
 
     /** Recovers data using the payload limit derived from the configured maximum protocol line. */
     public static RecoveryResult recover(Path dataDirectory, int maxLineBytes) throws RecoveryException {
-        return new StorageRecovery(RecordCodec.forMaxLineBytes(maxLineBytes))
+        return recover(dataDirectory, maxLineBytes, MAX_RECOVERED_PAYLOAD_BYTES);
+    }
+
+    /** Recovers using a broker-specific aggregate raw UTF-8 payload cap. */
+    public static RecoveryResult recover(Path dataDirectory, int maxLineBytes, long payloadCapBytes)
+            throws RecoveryException {
+        if (payloadCapBytes < 0) {
+            throw new IllegalArgumentException("payloadCapBytes must be non-negative");
+        }
+        return new StorageRecovery(RecordCodec.forMaxLineBytes(maxLineBytes), payloadCapBytes)
                 .recoverDataDirectory(dataDirectory);
     }
 
@@ -82,7 +97,7 @@ public final class StorageRecovery {
         for (Map.Entry<String, MutableTopic> entry : recovered.entrySet()) {
             MutableTopic topic = entry.getValue();
             immutableTopics.put(entry.getKey(), new RecoveredTopic(topic.name, topic.nextOffset,
-                    topic.messages, topic.ackedOffsets, topic.payloadBytes));
+                    topic.messages, topic.publishedAtMillisByOffset, topic.ackedOffsets, topic.payloadBytes));
         }
 
         // Validate the complete directory before making any tail repair, so a later topic failure
@@ -196,15 +211,25 @@ public final class StorageRecovery {
                         topic.name, segment, record.offset());
             }
             byte[] payload = record.payload();
+            try {
+                StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .decode(ByteBuffer.wrap(payload));
+            } catch (CharacterCodingException exception) {
+                throw new RecoveryException("invalid UTF-8 PUBLISH payload in " + segment.getFileName()
+                        + " for topic " + topic.name, topic.name, segment, record.offset(), exception);
+            }
             long total = addPayloadBytes(totalPayloadBytes[0], payload.length, topic.name, segment, record.offset());
-            if (total > MAX_RECOVERED_PAYLOAD_BYTES) {
-                throw new RecoveryException("recovered payload cap " + MAX_RECOVERED_PAYLOAD_BYTES
+            if (total > payloadCapBytes) {
+                throw new RecoveryException("recovered payload cap " + payloadCapBytes
                         + " bytes exceeded by total " + total + " bytes",
                         topic.name, segment, record.offset());
             }
             totalPayloadBytes[0] = total;
             topicPayloadBytes[0] += payload.length;
             topic.messages.put(record.offset(), payload);
+            topic.publishedAtMillisByOffset.put(record.offset(), record.timestampMillis());
             topic.nextOffset++;
         } else {
             if (!topic.messages.containsKey(record.offset())) {
@@ -244,6 +269,7 @@ public final class StorageRecovery {
         private long nextOffset;
         private long payloadBytes;
         private final Map<Long, byte[]> messages = new LinkedHashMap<>();
+        private final Map<Long, Long> publishedAtMillisByOffset = new LinkedHashMap<>();
         private final Set<Long> ackedOffsets = new LinkedHashSet<>();
 
         private MutableTopic(String name) {

@@ -1,6 +1,10 @@
 package dev.miniq.core;
 
 import java.time.Clock;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -12,6 +16,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import dev.miniq.core.storage.RecoveredTopic;
+import dev.miniq.core.storage.RecoveryException;
+import dev.miniq.core.storage.RecoveryResult;
+import dev.miniq.core.storage.StorageRecovery;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -21,6 +29,7 @@ public final class Broker implements AutoCloseable {
 
     private final Clock clock;
     private final BrokerConfig config;
+    private final PayloadBudget payloadBudget;
     private final TopicRegistry topics;
     private final TimeoutScheduler timeoutScheduler;
     private final ConcurrentMap<String, TopicDelivery> deliveriesByTopic = new ConcurrentHashMap<>();
@@ -28,32 +37,71 @@ public final class Broker implements AutoCloseable {
     private final ConcurrentMap<String, CopyOnWriteArrayList<Subscription>> subscribersByTopic = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, TopicPump> pumpByTopic = new ConcurrentHashMap<>();
     private final Object subscriptionLock = new Object();
+    private final Object lifecycleLock = new Object();
     private final AtomicBoolean closed = new AtomicBoolean();
 
     public Broker(Clock clock, BrokerConfig config) {
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
         this.config = Objects.requireNonNull(config, "config must not be null");
-        this.topics = new TopicRegistry(config.maxLineBytes());
+        this.payloadBudget = null;
         this.timeoutScheduler = new TimeoutScheduler(clock, this::pumpTopic);
+        this.topics = new TopicRegistry(config.maxLineBytes(), name ->
+                new Topic(name, config.maxLineBytes(), new InMemoryTopicLog()));
+    }
+
+    /** Creates a broker that recovers and appends topic logs in the configured data directory. */
+    public Broker(Clock clock, BrokerConfig config, PersistenceConfig persistenceConfig)
+            throws RecoveryException {
+        this(clock, config, persistenceConfig, null);
+    }
+
+    Broker(Clock clock, BrokerConfig config, PersistenceConfig persistenceConfig, TopicLogFactory testLogFactory)
+            throws RecoveryException {
+        this.clock = Objects.requireNonNull(clock, "clock must not be null");
+        this.config = Objects.requireNonNull(config, "config must not be null");
+        Objects.requireNonNull(persistenceConfig, "persistenceConfig must not be null");
+        RecoveryResult recovered = StorageRecovery.recover(persistenceConfig.dataDirectory(),
+                config.maxLineBytes(), persistenceConfig.payloadCapBytes());
+        this.payloadBudget = new PayloadBudget(persistenceConfig.payloadCapBytes(), recovered.payloadBytes());
+        this.timeoutScheduler = new TimeoutScheduler(clock, this::pumpTopic);
+        TopicLogFactory logFactory;
+        if (testLogFactory != null) {
+            logFactory = testLogFactory;
+        } else {
+            logFactory = (name, state) -> new FileTopicLog(persistenceConfig.dataDirectory(), name,
+                    config.maxLineBytes(), persistenceConfig,
+                    state == null ? java.util.Set.of() : state.ackedOffsets());
+        }
+        this.topics = new TopicRegistry(config.maxLineBytes(), name ->
+                new Topic(name, config.maxLineBytes(), logFactory.create(name, null)));
+        List<Topic> recoveredTopics = new ArrayList<>();
+        for (RecoveredTopic state : recovered.topics().values()) {
+            recoveredTopics.add(topicFromRecovery(state, logFactory));
+        }
+        topics.registerRecovered(recoveredTopics);
     }
 
     /** Starts the broker's single shared daemon timeout worker. */
     public void start() {
-        if (closed.get()) {
-            throw new IllegalStateException("broker is closed");
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            timeoutScheduler.start();
         }
-        timeoutScheduler.start();
     }
 
     /** Validates and appends a message, then pushes available messages to subscribers. */
     public Message publish(String topic, String payload) {
-        ensureOpen();
-        String validTopic = TopicName.validate(topic);
-        if (payload == null) {
-            throw new IllegalArgumentException("payload must not be null");
+        TopicDelivery delivery;
+        Message message;
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            String validTopic = TopicName.validate(topic);
+            if (payload == null) {
+                throw new IllegalArgumentException("payload must not be null");
+            }
+            delivery = getOrCreateDelivery(validTopic);
+            message = delivery.publish(payload);
         }
-        TopicDelivery delivery = getOrCreateDelivery(validTopic);
-        Message message = delivery.publish(payload);
         pumpTopic(delivery);
         return message;
     }
@@ -64,47 +112,57 @@ public final class Broker implements AutoCloseable {
 
     /** Registers at most one inactive topic subscription for this connection. */
     public SubscribeResult subscribe(String connectionId, String topic, long ackTimeoutMs, DeliverySink sink) {
-        ensureOpen();
-        Objects.requireNonNull(connectionId, "connectionId must not be null");
-        Objects.requireNonNull(sink, "sink must not be null");
-        String validTopic = TopicName.validate(topic);
-        validateAckTimeout(ackTimeoutMs);
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            Objects.requireNonNull(connectionId, "connectionId must not be null");
+            Objects.requireNonNull(sink, "sink must not be null");
+            String validTopic = TopicName.validate(topic);
+            validateAckTimeout(ackTimeoutMs);
 
-        TopicDelivery delivery;
-        synchronized (subscriptionLock) {
-            if (subscriptionsByConnection.containsKey(connectionId)) {
-                return SubscribeResult.ALREADY_SUBSCRIBED;
+            synchronized (subscriptionLock) {
+                if (subscriptionsByConnection.containsKey(connectionId)) {
+                    return SubscribeResult.ALREADY_SUBSCRIBED;
+                }
+                TopicDelivery delivery = getOrCreateDelivery(validTopic);
+                delivery.register(connectionId, ackTimeoutMs, config.maxInFlight());
+                Subscription subscription = new Subscription(connectionId, validTopic, delivery, sink);
+                subscriptionsByConnection.put(connectionId, subscription);
+                subscribersByTopic.computeIfAbsent(validTopic, ignored -> new CopyOnWriteArrayList<>()).add(subscription);
             }
-            delivery = getOrCreateDelivery(validTopic);
-            delivery.register(connectionId, ackTimeoutMs, config.maxInFlight());
-            Subscription subscription = new Subscription(connectionId, validTopic, delivery, sink);
-            subscriptionsByConnection.put(connectionId, subscription);
-            subscribersByTopic.computeIfAbsent(validTopic, ignored -> new CopyOnWriteArrayList<>()).add(subscription);
         }
         return SubscribeResult.OK;
     }
 
     /** Activates a registered subscription after its SUBSCRIBE reply has been written. */
     public void startDelivery(String connectionId) {
-        Objects.requireNonNull(connectionId, "connectionId must not be null");
-        Subscription subscription = subscriptionsByConnection.get(connectionId);
-        if (subscription == null) {
-            return;
+        Subscription subscription;
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            Objects.requireNonNull(connectionId, "connectionId must not be null");
+            subscription = subscriptionsByConnection.get(connectionId);
+            if (subscription == null) {
+                return;
+            }
+            subscription.active = true;
         }
-        subscription.active = true;
         pumpTopic(subscription.delivery);
     }
 
     /** Acknowledges the current delivery owned by this connection, then fills freed capacity. */
     public AckResult ack(String connectionId, String topic, long offset, int deliveryCount) {
-        Objects.requireNonNull(connectionId, "connectionId must not be null");
-        String validTopic = TopicName.validate(topic);
-        Subscription subscription = subscriptionsByConnection.get(connectionId);
-        if (subscription == null || !subscription.topicName.equals(validTopic)) {
-            return AckResult.NOT_IN_FLIGHT;
-        }
+        Subscription subscription;
+        AckResult result;
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            Objects.requireNonNull(connectionId, "connectionId must not be null");
+            String validTopic = TopicName.validate(topic);
+            subscription = subscriptionsByConnection.get(connectionId);
+            if (subscription == null || !subscription.topicName.equals(validTopic)) {
+                return AckResult.NOT_IN_FLIGHT;
+            }
 
-        AckResult result = subscription.delivery.ack(connectionId, offset, deliveryCount);
+            result = subscription.delivery.ack(connectionId, offset, deliveryCount);
+        }
         if (result == AckResult.ACKED) {
             pumpTopic(subscription.delivery);
         }
@@ -113,16 +171,19 @@ public final class Broker implements AutoCloseable {
 
     /** Releases the connection's active subscription and pumps its returned messages elsewhere. */
     public void disconnect(String connectionId) {
-        Objects.requireNonNull(connectionId, "connectionId must not be null");
         Subscription subscription;
-        synchronized (subscriptionLock) {
-            subscription = subscriptionsByConnection.remove(connectionId);
-            if (subscription != null) {
-                List<Subscription> topicSubscribers = subscribersByTopic.get(subscription.topicName);
-                if (topicSubscribers != null) {
-                    topicSubscribers.remove(subscription);
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            Objects.requireNonNull(connectionId, "connectionId must not be null");
+            synchronized (subscriptionLock) {
+                subscription = subscriptionsByConnection.remove(connectionId);
+                if (subscription != null) {
+                    List<Subscription> topicSubscribers = subscribersByTopic.get(subscription.topicName);
+                    if (topicSubscribers != null) {
+                        topicSubscribers.remove(subscription);
+                    }
+                    subscription.delivery.release(connectionId);
                 }
-                subscription.delivery.release(connectionId);
             }
         }
         if (subscription != null) {
@@ -132,43 +193,69 @@ public final class Broker implements AutoCloseable {
 
     /** Returns an immutable per-topic stats snapshot; concurrent topics are captured independently. */
     public BrokerStats stats() {
-        Map<String, BrokerStats.TopicStats> perTopic = new TreeMap<>();
-        deliveriesByTopic.forEach((topicName, delivery) -> perTopic.put(topicName, delivery.statsSnapshot()));
-        long published = 0;
-        long ready = 0;
-        long inFlight = 0;
-        long acked = 0;
-        long redeliveries = 0;
-        for (BrokerStats.TopicStats topicStats : perTopic.values()) {
-            published += topicStats.published();
-            ready += topicStats.ready();
-            inFlight += topicStats.inFlight();
-            acked += topicStats.acked();
-            redeliveries += topicStats.redeliveries();
+        synchronized (lifecycleLock) {
+            ensureOpen();
+            Map<String, BrokerStats.TopicStats> perTopic = new TreeMap<>();
+            deliveriesByTopic.forEach((topicName, delivery) -> perTopic.put(topicName, delivery.statsSnapshot()));
+            long published = 0;
+            long ready = 0;
+            long inFlight = 0;
+            long acked = 0;
+            long redeliveries = 0;
+            for (BrokerStats.TopicStats topicStats : perTopic.values()) {
+                published += topicStats.published();
+                ready += topicStats.ready();
+                inFlight += topicStats.inFlight();
+                acked += topicStats.acked();
+                redeliveries += topicStats.redeliveries();
+            }
+            return new BrokerStats(published, ready, inFlight, acked, redeliveries, perTopic);
         }
-        return new BrokerStats(published, ready, inFlight, acked, redeliveries, perTopic);
     }
 
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        synchronized (subscriptionLock) {
-            List<Subscription> active = new ArrayList<>(subscriptionsByConnection.values());
-            subscriptionsByConnection.clear();
-            subscribersByTopic.clear();
-            for (Subscription subscription : active) {
-                subscription.delivery.release(subscription.connectionId);
+        synchronized (lifecycleLock) {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            synchronized (subscriptionLock) {
+                List<Subscription> active = new ArrayList<>(subscriptionsByConnection.values());
+                subscriptionsByConnection.clear();
+                subscribersByTopic.clear();
+                for (Subscription subscription : active) {
+                    subscription.delivery.release(subscription.connectionId);
+                }
             }
         }
-        timeoutScheduler.close();
+        RuntimeException failure = null;
+        try {
+            timeoutScheduler.close();
+        } catch (RuntimeException closeFailure) {
+            failure = closeFailure;
+        }
+        synchronized (lifecycleLock) {
+            for (Topic topic : topics.topics()) {
+                try {
+                    topic.closeLog();
+                } catch (RuntimeException closeFailure) {
+                    if (failure == null) {
+                        failure = closeFailure;
+                    } else {
+                        failure.addSuppressed(closeFailure);
+                    }
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     private TopicDelivery getOrCreateDelivery(String topicName) {
         return deliveriesByTopic.computeIfAbsent(topicName, name -> {
             Topic topic = topics.getOrCreate(name);
-            TopicDelivery delivery = new TopicDelivery(topic, clock, timeoutScheduler);
+            TopicDelivery delivery = new TopicDelivery(topic, clock, timeoutScheduler, payloadBudget);
             timeoutScheduler.register(delivery);
             return delivery;
         });
@@ -178,6 +265,36 @@ public final class Broker implements AutoCloseable {
         if (closed.get()) {
             throw new IllegalStateException("broker is closed");
         }
+    }
+
+    long payloadBytesUsed() {
+        return payloadBudget == null ? 0 : payloadBudget.usedBytes();
+    }
+
+    private Topic topicFromRecovery(RecoveredTopic recovered, TopicLogFactory logFactory) throws RecoveryException {
+        Map<Long, byte[]> payloads = recovered.messagesByOffset();
+        Map<Long, Long> timestamps = recovered.publishedAtMillisByOffset();
+        List<Message> messages = new ArrayList<>();
+        for (Map.Entry<Long, byte[]> entry : payloads.entrySet()) {
+            long offset = entry.getKey();
+            Long timestamp = timestamps.get(offset);
+            if (timestamp == null) {
+                throw new RecoveryException("missing timestamp for recovered offset " + offset,
+                        recovered.name(), null, offset);
+            }
+            try {
+                String payload = StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .decode(ByteBuffer.wrap(entry.getValue())).toString();
+                messages.add(new Message(recovered.name(), offset, payload, timestamp));
+            } catch (CharacterCodingException exception) {
+                throw new RecoveryException("invalid UTF-8 payload at recovered offset " + offset,
+                        recovered.name(), null, offset, exception);
+            }
+        }
+        TopicLog log = logFactory.create(recovered.name(), recovered);
+        return new Topic(recovered.name(), config.maxLineBytes(), log, messages);
     }
 
     private static void validateAckTimeout(long ackTimeoutMs) {
