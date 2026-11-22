@@ -1,5 +1,6 @@
 package dev.miniq.core.storage;
 
+import dev.miniq.core.AppendFailureException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -465,6 +466,61 @@ class SegmentWriterTest {
             }
         }
         assertThat(SegmentWriter.openRegistrySize()).isZero();
+    }
+
+    @Test
+    void partialRecordWriteFailureIsAmbiguousAndFailsWriterClosed() throws IOException {
+        Path dataDir = tempDir.resolve("partial-write-failure");
+        SegmentWriter.Config config = SegmentWriter.Config.defaults();
+        SegmentWriter writer = SegmentWriter.open(dataDir, "partial-write", config,
+                (directory, topics, topic, key, writerConfig) -> new SegmentWriter(directory, topics, topic, key,
+                        writerConfig, (channel, bytes) -> {
+                            bytes.limit(bytes.position() + 6);
+                            channel.write(bytes);
+                            throw new IOException("injected exception after partial record write");
+                        }, channel -> { }));
+
+        assertThatThrownBy(() -> writer.appendPublish("partial", 1))
+                .isInstanceOf(AppendFailureException.class)
+                .satisfies(failure -> assertThat(((AppendFailureException) failure).certainty())
+                        .isEqualTo(AppendFailureException.Certainty.AMBIGUOUS));
+        assertThatThrownBy(() -> writer.appendPublish("retry", 2))
+                .isInstanceOf(AppendFailureException.class)
+                .satisfies(failure -> assertThat(((AppendFailureException) failure).certainty())
+                        .isEqualTo(AppendFailureException.Certainty.DEFINITE));
+
+        writer.close();
+        try (SegmentWriter recovered = SegmentWriter.open(dataDir, "partial-write")) {
+            assertThat(recovered.nextOffset()).isZero();
+        }
+    }
+
+    @Test
+    void forceFailureAfterACompleteRecordIsAmbiguousAndRecordRecovers() throws IOException {
+        Path dataDir = tempDir.resolve("force-failure-after-write");
+        SegmentWriter.Config config = new SegmentWriter.Config(SegmentWriter.DEFAULT_SEGMENT_SIZE_BYTES,
+                RecordCodec.DEFAULT_MAX_RECORD_BYTES, FsyncMode.EVERY_WRITE);
+        SegmentWriter writer = SegmentWriter.open(dataDir, "force-failure", config,
+                (directory, topics, topic, key, writerConfig) -> new SegmentWriter(directory, topics, topic, key,
+                        writerConfig, (channel, bytes) -> {
+                            while (bytes.hasRemaining()) {
+                                channel.write(bytes);
+                            }
+                        },
+                        channel -> { throw new IOException("injected force failure after complete write"); }));
+
+        assertThatThrownBy(() -> writer.appendPublish("persisted", 1))
+                .isInstanceOf(AppendFailureException.class)
+                .satisfies(failure -> assertThat(((AppendFailureException) failure).certainty())
+                        .isEqualTo(AppendFailureException.Certainty.AMBIGUOUS));
+        assertThatThrownBy(() -> writer.appendPublish("must-not-follow", 2))
+                .isInstanceOf(AppendFailureException.class)
+                .satisfies(failure -> assertThat(((AppendFailureException) failure).certainty())
+                        .isEqualTo(AppendFailureException.Certainty.DEFINITE));
+        writer.close();
+        try (SegmentWriter recovered = SegmentWriter.open(dataDir, "force-failure", config)) {
+            assertThat(recovered.nextOffset()).isOne();
+        }
     }
 
     private static List<String> fileNames(Path directory) throws IOException {

@@ -79,7 +79,7 @@ public final class TopicDelivery {
                 readyOffsets.add(message.offset());
                 return message;
             } catch (RuntimeException | Error failure) {
-                if (reserved) {
+                if (reserved && AppendFailureException.isDefinitelyNotWritten(failure)) {
                     payloadBudget.release(payloadBytes);
                 }
                 throw failure;

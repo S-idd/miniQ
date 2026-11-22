@@ -222,6 +222,8 @@ None currently.
 - Topic logs append before offsets or delivery state advance. Recovery installs messages and ACKed offsets before subscriptions start; a shared byte budget reserves UTF-8 payload bytes across topics and releases them when append fails.
 - The broker closes topic logs with its timeout scheduler. Per-topic file logs open lazily, use the Day 14 segment writer, and apply the configured fsync mode.
 - After an append error, a topic's writer stays failed until the broker restarts, and recovery then truncates any partial record.
+- Append failures before any record write are definite and release the payload reservation; failures after a write starts are ambiguous and keep it charged.
+- An ambiguous failure fails that topic's log closed until restart, and recovery rebuilds the charged total from whatever complete records survived.
 
 ## Core API summary
 

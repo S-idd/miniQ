@@ -16,6 +16,7 @@ final class FileTopicLog implements TopicLog {
     private final Set<Long> recoveredAckedOffsets;
     private SegmentWriter writer;
     private boolean closed;
+    private boolean failedClosed;
 
     FileTopicLog(Path dataDirectory, String topicName, int maxLineBytes, PersistenceConfig persistenceConfig,
                  Set<Long> recoveredAckedOffsets) {
@@ -29,16 +30,40 @@ final class FileTopicLog implements TopicLog {
 
     @Override
     public void appendPublish(long expectedOffset, String payload, long timestampMillis) throws IOException {
-        SegmentWriter current = writer();
-        long offset = current.appendPublish(payload, timestampMillis);
-        if (offset != expectedOffset) {
-            throw new IOException("segment writer assigned offset " + offset + "; expected " + expectedOffset);
+        SegmentWriter current = writerForAppend("PUBLISH");
+        try {
+            long offset = current.appendPublish(payload, timestampMillis);
+            if (offset != expectedOffset) {
+                throw AppendFailureException.ambiguous("segment writer assigned offset " + offset
+                        + "; expected " + expectedOffset, null);
+            }
+        } catch (AppendFailureException failure) {
+            failClosedIfAmbiguous(failure);
+            throw failure;
+        } catch (IOException failure) {
+            failedClosed = true;
+            throw AppendFailureException.ambiguous("unclassified PUBLISH append failure", failure);
+        } catch (RuntimeException | Error failure) {
+            failedClosed = true;
+            throw failure;
         }
     }
 
     @Override
     public void appendAck(long offset, long timestampMillis) throws IOException {
-        writer().appendAck(offset, timestampMillis);
+        SegmentWriter current = writerForAppend("ACK");
+        try {
+            current.appendAck(offset, timestampMillis);
+        } catch (AppendFailureException failure) {
+            failClosedIfAmbiguous(failure);
+            throw failure;
+        } catch (IOException failure) {
+            failedClosed = true;
+            throw AppendFailureException.ambiguous("unclassified ACK append failure", failure);
+        } catch (RuntimeException | Error failure) {
+            failedClosed = true;
+            throw failure;
+        }
     }
 
     @Override
@@ -48,12 +73,33 @@ final class FileTopicLog implements TopicLog {
 
     private SegmentWriter writer() throws IOException {
         if (closed) {
-            throw new IOException("topic log is closed");
+            throw AppendFailureException.definite("topic log is closed");
         }
         if (writer == null) {
             writer = SegmentWriter.open(dataDirectory, topicName, writerConfig);
         }
         return writer;
+    }
+
+    private SegmentWriter writerForAppend(String recordType) throws IOException {
+        if (failedClosed) {
+            throw AppendFailureException.definite("topic log is failed closed after an ambiguous "
+                    + recordType + " append failure");
+        }
+        try {
+            return writer();
+        } catch (AppendFailureException failure) {
+            throw failure;
+        } catch (IOException failure) {
+            throw AppendFailureException.definite("could not open the topic log before appending " + recordType,
+                    failure);
+        }
+    }
+
+    private void failClosedIfAmbiguous(AppendFailureException failure) {
+        if (failure.certainty() == AppendFailureException.Certainty.AMBIGUOUS) {
+            failedClosed = true;
+        }
     }
 
     @Override

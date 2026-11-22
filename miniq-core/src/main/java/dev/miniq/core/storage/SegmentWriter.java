@@ -1,5 +1,7 @@
 package dev.miniq.core.storage;
 
+import dev.miniq.core.AppendFailureException;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -45,6 +47,8 @@ public final class SegmentWriter implements AutoCloseable {
     private final Path registryKey;
     private final Config config;
     private final RecordCodec codec;
+    private final RecordWriteStrategy recordWriteStrategy;
+    private final ForceStrategy forceStrategy;
     private final Set<Long> ackedOffsets = new HashSet<>();
 
     private long nextOffset;
@@ -60,12 +64,30 @@ public final class SegmentWriter implements AutoCloseable {
 
     private SegmentWriter(Path dataDirectory, Path topicsDirectory, Path topicDirectory, Path registryKey,
                           Config config) {
+        this(dataDirectory, topicsDirectory, topicDirectory, registryKey, config,
+                SegmentWriter::writeFully, channel -> channel.force(true));
+    }
+
+    SegmentWriter(Path dataDirectory, Path topicsDirectory, Path topicDirectory, Path registryKey,
+                  Config config, RecordWriteStrategy recordWriteStrategy, ForceStrategy forceStrategy) {
         this.dataDirectory = dataDirectory;
         this.topicsDirectory = topicsDirectory;
         this.topicDirectory = topicDirectory;
         this.registryKey = registryKey;
         this.config = config;
         this.codec = new RecordCodec(config.maxRecordBytes());
+        this.recordWriteStrategy = Objects.requireNonNull(recordWriteStrategy, "recordWriteStrategy must not be null");
+        this.forceStrategy = Objects.requireNonNull(forceStrategy, "forceStrategy must not be null");
+    }
+
+    @FunctionalInterface
+    interface RecordWriteStrategy {
+        void write(FileChannel channel, ByteBuffer bytes) throws IOException;
+    }
+
+    @FunctionalInterface
+    interface ForceStrategy {
+        void force(FileChannel channel) throws IOException;
     }
 
     @FunctionalInterface
@@ -142,7 +164,7 @@ public final class SegmentWriter implements AutoCloseable {
         Objects.requireNonNull(payload, "payload must not be null");
         ensureWritable();
         if (nextOffset == Long.MAX_VALUE) {
-            throw new IOException("topic offset space is exhausted");
+            throw AppendFailureException.definite("topic offset space is exhausted");
         }
         StorageRecord record = StorageRecord.publish(nextOffset, timestampMillis, payload);
         appendEncoded(record);
@@ -160,18 +182,36 @@ public final class SegmentWriter implements AutoCloseable {
     }
 
     private void appendEncoded(StorageRecord record) throws IOException {
-        byte[] encoded = codec.encode(record);
+        byte[] encoded;
+        try {
+            encoded = codec.encode(record);
+        } catch (IllegalArgumentException failure) {
+            throw AppendFailureException.definite("record could not be encoded before writing", failure);
+        } catch (RuntimeException | Error failure) {
+            // An unclassified throwable is ambiguous by policy, so keep this writer closed.
+            failClosed();
+            throw failure;
+        }
+        boolean recordWriteStarted = false;
         try {
             ensureSegmentFor(encoded.length);
-            writeFully(channel, ByteBuffer.wrap(encoded));
+            // From this point every failure is ambiguous, even if the first write call throws.
+            recordWriteStarted = true;
+            recordWriteStrategy.write(channel, ByteBuffer.wrap(encoded));
             if (config.fsyncMode() == FsyncMode.EVERY_WRITE) {
-                channel.force(true);
+                forceStrategy.force(channel);
             }
             currentSize += encoded.length;
             currentHasRecords = true;
         } catch (IOException exception) {
             failClosed();
-            throw exception;
+            AppendFailureException.Certainty certainty = recordWriteStarted
+                    ? AppendFailureException.Certainty.AMBIGUOUS
+                    : AppendFailureException.Certainty.DEFINITE;
+            throw new AppendFailureException("could not append record", certainty, exception);
+        } catch (RuntimeException | Error failure) {
+            failClosed();
+            throw failure;
         }
     }
 
@@ -354,10 +394,10 @@ public final class SegmentWriter implements AutoCloseable {
 
     private void ensureWritable() throws IOException {
         if (closed.get()) {
-            throw new IOException("segment writer is closed");
+            throw AppendFailureException.definite("segment writer is closed");
         }
         if (failed) {
-            throw new IOException("segment writer is failed closed after an earlier append error");
+            throw AppendFailureException.definite("segment writer is failed closed after an earlier append error");
         }
     }
 

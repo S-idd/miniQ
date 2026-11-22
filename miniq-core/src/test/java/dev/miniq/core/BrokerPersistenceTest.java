@@ -1,7 +1,9 @@
 package dev.miniq.core;
 
 import dev.miniq.core.storage.FsyncMode;
+import dev.miniq.core.storage.RecordCodec;
 import dev.miniq.core.storage.RecoveryException;
+import dev.miniq.core.storage.SegmentWriter;
 import dev.miniq.core.storage.TopicDirectoryNames;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
@@ -21,6 +23,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -225,6 +228,108 @@ class BrokerPersistenceTest {
     }
 
     @Test
+    void ambiguousPublishFailureKeepsReservationWhileOtherTopicRacesAtTheCap() throws Exception {
+        Path data = tempDir.resolve("ambiguous-publish-cap");
+        CountDownLatch recordWritten = new CountDownLatch(1);
+        CountDownLatch finishFailure = new CountDownLatch(1);
+        WritingTopicLog logA = new WritingTopicLog(data, "a", Set.of());
+        logA.failNextPublishAfterWrite(recordWritten, finishFailure);
+        Broker broker = brokerWithWritingLogs(data, 5, Map.of("a", logA));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> failedPublish = executor.submit(() -> broker.publish("a", "four"));
+            assertThat(recordWritten.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(broker.payloadBytesUsed()).isEqualTo(4);
+
+            assertThatThrownBy(() -> broker.publish("b", "xx"))
+                    .isInstanceOf(PayloadLimitException.class);
+            assertThat(broker.payloadBytesUsed()).isEqualTo(4);
+
+            finishFailure.countDown();
+            assertThatThrownBy(() -> failedPublish.get(2, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(StorageException.class);
+            assertThat(broker.payloadBytesUsed()).isEqualTo(4);
+            assertThatThrownBy(() -> broker.publish("a", "x"))
+                    .isInstanceOf(StorageException.class);
+            assertThat(broker.payloadBytesUsed()).isEqualTo(4);
+        } finally {
+            finishFailure.countDown();
+            broker.close();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void ambiguousPublishFailureRecoversTheWrittenRecordAndMatchingPayloadTotal() throws Exception {
+        Path data = tempDir.resolve("ambiguous-publish-recovery");
+        WritingTopicLog logA = new WritingTopicLog(data, "a", Set.of());
+        logA.failNextPublishAfterWrite(null, null);
+        try (Broker broker = brokerWithWritingLogs(data, 4, Map.of("a", logA))) {
+            assertThatThrownBy(() -> broker.publish("a", "four")).isInstanceOf(StorageException.class);
+            assertThat(broker.payloadBytesUsed()).isEqualTo(4);
+        }
+
+        try (Broker recovered = persistent(data, 4)) {
+            recovered.subscribe("recovered-reader", "a", ignored -> { });
+            assertThat(recovered.payloadBytesUsed()).isEqualTo(4);
+            assertThat(recovered.stats().perTopic().get("a").published()).isOne();
+        }
+    }
+
+    @Test
+    void ambiguousAckFailsItsTopicClosedButAnotherTopicCanPublishAndAck() throws Exception {
+        Path data = tempDir.resolve("ambiguous-ack-fail-closed");
+        try (Broker seed = persistent(data)) {
+            seed.publish("a", "first-a");
+            seed.publish("b", "first-b");
+        }
+        Map<String, WritingTopicLog> logs = new ConcurrentHashMap<>();
+        Broker broker = brokerWithWritingLogs(data, 100, logs);
+        List<Delivery> deliveriesA = new java.util.concurrent.CopyOnWriteArrayList<>();
+        List<Delivery> deliveriesB = new java.util.concurrent.CopyOnWriteArrayList<>();
+        try {
+            broker.subscribe("consumer-a", "a", deliveriesA::add);
+            broker.subscribe("consumer-b", "b", deliveriesB::add);
+            broker.startDelivery("consumer-a");
+            broker.startDelivery("consumer-b");
+            assertThat(deliveriesA).hasSize(1);
+            assertThat(deliveriesB).hasSize(1);
+
+            logs.get("a").failNextAckAfterWrite();
+            assertThatThrownBy(() -> broker.ack("consumer-a", "a", 0, 1))
+                    .isInstanceOf(StorageException.class);
+            assertThatThrownBy(() -> broker.ack("consumer-a", "a", 0, 1))
+                    .isInstanceOf(StorageException.class);
+            assertThatThrownBy(() -> broker.publish("a", "later-a"))
+                    .isInstanceOf(StorageException.class);
+
+            assertThat(broker.ack("consumer-b", "b", 0, 1)).isEqualTo(AckResult.ACKED);
+            assertThat(broker.publish("b", "later-b").offset()).isOne();
+            assertThat(deliveriesB).hasSize(2);
+            assertThat(broker.ack("consumer-b", "b", 1, 1)).isEqualTo(AckResult.ACKED);
+            assertThat(broker.stats().perTopic().get("a").inFlight()).isOne();
+            assertThat(broker.stats().perTopic().get("b").acked()).isEqualTo(2);
+        } finally {
+            broker.close();
+        }
+    }
+
+    @Test
+    void definitePreWriteFailureReleasesReservationAndRetriesTheSameOffset() throws Exception {
+        Path data = tempDir.resolve("definite-publish-failure");
+        WritingTopicLog logA = new WritingTopicLog(data, "a", Set.of());
+        logA.failNextPublishBeforeWrite();
+        try (Broker broker = brokerWithWritingLogs(data, 4, Map.of("a", logA))) {
+            assertThatThrownBy(() -> broker.publish("a", "four")).isInstanceOf(StorageException.class);
+            assertThat(broker.payloadBytesUsed()).isZero();
+            assertThat(broker.publish("a", "four").offset()).isZero();
+            assertThat(broker.payloadBytesUsed()).isEqualTo(4);
+        }
+    }
+
+    @Test
     void failedAppendReleasesSharedPayloadReservation() throws Exception {
         FaultInjectingTopicLog log = new FaultInjectingTopicLog();
         try (Broker broker = testBroker(4, log)) {
@@ -412,6 +517,16 @@ class BrokerPersistenceTest {
                 (name, recovered) -> topicLog);
     }
 
+    private Broker brokerWithWritingLogs(Path dataDirectory, long capBytes,
+                                         Map<String, WritingTopicLog> suppliedLogs) throws RecoveryException {
+        Map<String, WritingTopicLog> logs = suppliedLogs instanceof ConcurrentHashMap
+                ? suppliedLogs : new ConcurrentHashMap<>(suppliedLogs);
+        return new Broker(new MutableClock(START), BROKER_CONFIG,
+                new PersistenceConfig(dataDirectory, FsyncMode.NONE, capBytes),
+                (name, recovered) -> logs.computeIfAbsent(name, ignored -> new WritingTopicLog(
+                        dataDirectory, name, recovered == null ? Set.of() : recovered.ackedOffsets())));
+    }
+
     private static Path onlySegment(Path dataDirectory, String topicName) throws IOException {
         Path topic = dataDirectory.resolve("topics").resolve(TopicDirectoryNames.forTopic(topicName));
         try (var files = Files.newDirectoryStream(topic, "segment-*.log")) {
@@ -468,7 +583,7 @@ class BrokerPersistenceTest {
         @Override
         public void appendPublish(long expectedOffset, String payload, long timestampMillis) throws IOException {
             if (appendCalls.incrementAndGet() == failAt) {
-                throw new IOException("injected append failure");
+                throw AppendFailureException.definite("injected append failure before write");
             }
             super.appendPublish(expectedOffset, payload, timestampMillis);
         }
@@ -476,7 +591,7 @@ class BrokerPersistenceTest {
         @Override
         public void appendAck(long offset, long timestampMillis) throws IOException {
             if (appendCalls.incrementAndGet() == failAt) {
-                throw new IOException("injected append failure");
+                throw AppendFailureException.definite("injected append failure before write");
             }
             super.appendAck(offset, timestampMillis);
         }
@@ -498,6 +613,115 @@ class BrokerPersistenceTest {
                 throw new IOException("interrupted while waiting to unblock topic A append", interrupted);
             }
             super.appendPublish(expectedOffset, payload, timestampMillis);
+        }
+    }
+
+    private static final class WritingTopicLog implements TopicLog {
+        private final Path dataDirectory;
+        private final String topicName;
+        private final Set<Long> recoveredAckedOffsets;
+        private SegmentWriter writer;
+        private volatile boolean failedClosed;
+        private volatile boolean failNextPublishBeforeWrite;
+        private volatile boolean failNextPublishAfterWrite;
+        private volatile boolean failNextAckAfterWrite;
+        private volatile CountDownLatch recordWritten;
+        private volatile CountDownLatch finishFailure;
+
+        private WritingTopicLog(Path dataDirectory, String topicName, Set<Long> recoveredAckedOffsets) {
+            this.dataDirectory = dataDirectory;
+            this.topicName = topicName;
+            this.recoveredAckedOffsets = Set.copyOf(recoveredAckedOffsets);
+        }
+
+        void failNextPublishBeforeWrite() {
+            failNextPublishBeforeWrite = true;
+        }
+
+        void failNextPublishAfterWrite(CountDownLatch recordWritten, CountDownLatch finishFailure) {
+            failNextPublishAfterWrite = true;
+            this.recordWritten = recordWritten;
+            this.finishFailure = finishFailure;
+        }
+
+        void failNextAckAfterWrite() {
+            failNextAckAfterWrite = true;
+        }
+
+        @Override
+        public void appendPublish(long expectedOffset, String payload, long timestampMillis) throws IOException {
+            ensureWritable();
+            if (failNextPublishBeforeWrite) {
+                failNextPublishBeforeWrite = false;
+                throw AppendFailureException.definite("injected failure before record write");
+            }
+            long offset = writer().appendPublish(payload, timestampMillis);
+            if (offset != expectedOffset) {
+                failedClosed = true;
+                throw AppendFailureException.ambiguous("test writer assigned an unexpected offset", null);
+            }
+            if (failNextPublishAfterWrite) {
+                failNextPublishAfterWrite = false;
+                failClosedAndThrowAfterWrite("injected failure after complete PUBLISH write");
+            }
+        }
+
+        @Override
+        public void appendAck(long offset, long timestampMillis) throws IOException {
+            ensureWritable();
+            writer().appendAck(offset, timestampMillis);
+            if (failNextAckAfterWrite) {
+                failNextAckAfterWrite = false;
+                failClosedAndThrowAfterWrite("injected failure after complete ACK write");
+            }
+        }
+
+        private void failClosedAndThrowAfterWrite(String message) throws IOException {
+            failedClosed = true;
+            CountDownLatch written = recordWritten;
+            if (written != null) {
+                written.countDown();
+            }
+            CountDownLatch finish = finishFailure;
+            if (finish != null) {
+                try {
+                    if (!finish.await(5, TimeUnit.SECONDS)) {
+                        throw new IOException("timed out waiting to inject ambiguous failure");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while injecting ambiguous failure", interrupted);
+                }
+            }
+            throw AppendFailureException.ambiguous(message, new IOException(message));
+        }
+
+        private void ensureWritable() throws AppendFailureException {
+            if (failedClosed) {
+                throw AppendFailureException.definite("injected topic log is failed closed");
+            }
+        }
+
+        private SegmentWriter writer() throws IOException {
+            if (writer == null) {
+                int maxRecordBytes = RecordCodec.forMaxLineBytes(BROKER_CONFIG.maxLineBytes()).maxRecordBytes();
+                writer = SegmentWriter.open(dataDirectory, topicName,
+                        new SegmentWriter.Config(SegmentWriter.DEFAULT_SEGMENT_SIZE_BYTES, maxRecordBytes, FsyncMode.NONE));
+            }
+            return writer;
+        }
+
+        @Override
+        public Set<Long> recoveredAckedOffsets() {
+            return recoveredAckedOffsets;
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (writer != null) {
+                writer.close();
+                writer = null;
+            }
         }
     }
 }

@@ -25,6 +25,7 @@
 - [x] Day 15: plain-data startup recovery, topic-folder decoding, ACK/READY reconstruction, sequence and offset validation, deferred torn-tail repair, channel cleanup, zero-byte-tail and hostile-length regression coverage; broker integration remains for Day 16
 - [x] Day 16a: opt-in core persistence for publishes and ACKs, restart restoration of offsets/delivery state, shared UTF-8 payload cap, and broker lifecycle integration
 - [x] Day 16a follow-up: canonical SegmentWriter registry keys, single-owner close cleanup, and concurrent cross-topic persistence under lifecycle read/write locking
+- [x] Day 16a append-failure follow-up: classify definite versus ambiguous writes, preserve cap reservations for uncertain records, and fail the affected topic closed
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
 - [ ] Days 18–21: Spring Boot starter and demo apps
 - [ ] Days 22–23: Benchmark and optional @EmbeddedMiniQ
