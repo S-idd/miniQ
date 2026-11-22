@@ -24,6 +24,8 @@ ACK <topic> <offset> <deliveryCount>
 
 The proposed ACK shape was `ACK <topic> <offset>`. It is extended with `<deliveryCount>` because a delayed ACK for an expired attempt must not acknowledge a later redelivery of the same offset, including when it returns to the same connection. The count acts as a delivery-attempt token without adding a fourth command.
 
+With persistence enabled, PUBLISH and ACK return `OK` only after the corresponding record has been appended according to the selected fsync mode. A storage failure returns `ERR SERVER_ERROR` and changes no broker state. Once a topic writer has failed, writes to that topic continue returning `SERVER_ERROR` until the broker restarts.
+
 Responses are:
 
 ```text
@@ -52,7 +54,8 @@ The complete set of protocol errors is:
 | `ALREADY_SUBSCRIBED` | Connection attempts a second SUBSCRIBE after its first succeeded. |
 | `NOT_SUBSCRIBED` | Connection sends ACK without an active subscription. |
 | `ACK_NOT_IN_FLIGHT` | That topic/offset/attempt is no longer in flight for this connection; this includes expired attempts and unknown offsets. |
-| `SERVER_ERROR` | Unexpected broker-side failure prevented the command from completing. |
+| `PAYLOAD_LIMIT` | The broker-wide payload limit would be exceeded; the publish is not appended. |
+| `SERVER_ERROR` | A storage failure or unexpected broker-side failure prevented the command from completing. |
 
 Unknown commands and malformed commands receive the corresponding `ERR` line and leave the connection open. Invalid UTF-8, an oversized line, or an incomplete line followed by EOF closes the connection after any possible error response. An ACK received at or after its attempt deadline returns `ACK_NOT_IN_FLIGHT`, even if the timeout worker has not yet processed the deadline or the message has since been redelivered; the delivery count prevents that stale ACK from acknowledging the new attempt. A second SUBSCRIBE returns `ALREADY_SUBSCRIBED` and preserves the original subscription. On disconnect, all deliveries owned by that connection transition back to READY immediately; the broker closes the socket and redelivers them to an available subscriber.
 
@@ -168,4 +171,18 @@ S: ERR ALREADY_SUBSCRIBED "connection already has an active subscription"
 C: PUBLISH orders <payload making this line exceed 65536 bytes including LF>
 S: ERR LINE_TOO_LONG "maximum line size is 65536 bytes"
 ... server closes the connection ...
+```
+
+### 10. Publish rejected by the payload limit
+
+```text
+C: PUBLISH orders <payload that exceeds the broker-wide limit>
+S: ERR PAYLOAD_LIMIT "broker payload limit reached"
+```
+
+### 11. Persistent storage failure
+
+```text
+C: PUBLISH orders item-42
+S: ERR SERVER_ERROR "storage error"
 ```

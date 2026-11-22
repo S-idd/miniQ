@@ -4,7 +4,7 @@ MiniQ is a lightweight local broker so developers can test event-driven Spring B
 
 ## Status
 
-**v0.1 is IN-MEMORY ONLY.** Messages do not survive a broker restart. Persistence is planned for v0.2.
+**v0.2 adds opt-in persistence.** Without `--data-dir`, messages remain in memory and do not survive a broker restart.
 
 ## Quickstart
 
@@ -17,6 +17,28 @@ bash scripts/chaos-demo.sh
 ```
 
 The server prints `MINIQ_READY port=<port>` when it is listening. The chaos demo uses the shaded server and chaos JARs produced by the build.
+
+## Persistence (v0.2)
+
+Persistence is opt-in. Pass `--data-dir <path>` to store topic logs on disk. `--fsync NONE|EVERY_WRITE` selects the durability mode and defaults to `NONE`. With `NONE`, completed writes survive broker `kill -9` but are not promised to survive power loss. Without `--data-dir`, the broker writes nothing to disk.
+
+```sh
+java -jar miniq-server/target/miniq-server.jar --port 7070 --data-dir ./miniq-data --fsync NONE
+```
+
+The protocol still has exactly three commands:
+
+```text
+C: PUBLISH orders item-42
+S: OK 0
+C: SUBSCRIBE orders
+S: OK
+S: MSG orders 0 1 item-42
+C: ACK orders 0 1
+S: OK
+```
+
+`NONE` does not promise power-loss durability. `EVERY_WRITE` forces each record and best-effort syncs parent directories when files are created; it cannot promise survival of failed devices or filesystems that do not honor flush requests. Persistence does not provide replication, backup, or protection from disk failure.
 
 ## Java client
 

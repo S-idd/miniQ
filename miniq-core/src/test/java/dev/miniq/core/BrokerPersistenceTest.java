@@ -56,6 +56,7 @@ class BrokerPersistenceTest {
         }
 
         try (Broker broker = persistent(data)) {
+            assertThat(broker.recoveryStats()).isEqualTo(new RecoveryStats(1, 2));
             List<Delivery> deliveries = new ArrayList<>();
             broker.subscribe("after-restart", "orders", deliveries::add);
             broker.startDelivery("after-restart");
