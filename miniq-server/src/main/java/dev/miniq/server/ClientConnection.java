@@ -35,14 +35,14 @@ import dev.miniq.server.protocol.SubscribeCommand;
 /** Owns one client socket, its reader, and its single serialized outbound writer. */
 final class ClientConnection implements AutoCloseable {
     private static final Logger LOGGER = Logger.getLogger(ClientConnection.class.getName());
-    private static final int OUTBOUND_CAPACITY = 1_024;
+    static final int DEFAULT_OUTBOUND_CAPACITY = 1_024;
     private static final String STOP = new String("\u0000MINIQ_STOP\u0000");
     private final Broker broker;
     private final BrokerConfig config;
     private final String connectionId;
     private final Socket socket;
     private final Runnable onClosed;
-    private final BlockingQueue<String> outbound = new ArrayBlockingQueue<>(OUTBOUND_CAPACITY);
+    private final BlockingQueue<String> outbound;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean brokerDisconnectCalled = new AtomicBoolean();
     private final AtomicBoolean subscribed = new AtomicBoolean();
@@ -50,11 +50,17 @@ final class ClientConnection implements AutoCloseable {
     private volatile Thread writer;
 
     ClientConnection(Broker broker, BrokerConfig config, String connectionId, Socket socket, Runnable onClosed) {
+        this(broker, config, connectionId, socket, onClosed, DEFAULT_OUTBOUND_CAPACITY);
+    }
+
+    ClientConnection(Broker broker, BrokerConfig config, String connectionId, Socket socket,
+                     Runnable onClosed, int outboundCapacity) {
         this.broker = Objects.requireNonNull(broker);
         this.config = Objects.requireNonNull(config);
         this.connectionId = Objects.requireNonNull(connectionId);
         this.socket = Objects.requireNonNull(socket);
         this.onClosed = Objects.requireNonNull(onClosed);
+        this.outbound = new ArrayBlockingQueue<>(outboundCapacity);
     }
 
     String connectionId() { return connectionId; }

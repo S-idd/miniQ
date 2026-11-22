@@ -80,6 +80,8 @@ Core invariants:
 
 Each subscription has a maximum of 16 in-flight messages by default; this is a configurable server setting. When its limit is reached, the dispatcher stops assigning messages to that subscriber and chooses another eligible subscriber if available. If no subscriber has capacity, messages remain READY. A full bounded connection writer queue causes that connection to be treated as disconnected, so its in-flight messages return to READY and can be offered to another subscriber. The cap limits broker-side unacknowledged work; it does not bound application work after a client has received a message.
 
+The server requires `maxInFlight <= outboundCapacity - 2`; the default outbound capacity is 1,024 lines, with two lines reserved for non-MSG replies such as OK and ERR. A full queue disconnects the slow consumer through the normal shutdown path, and `Broker.disconnect()` returns its unacknowledged attempts to READY. Delivery sinks only make a nonblocking queue offer; they never wait for queue space or a timer.
+
 ## Persistence preview — v0.2, not built yet
 
 Each topic will have append-only segment files with a versioned header and length-prefixed records. A record will include record type, topic-local offset, payload bytes (UTF-8 as specified by the wire protocol), and a checksum; payload length is derived from the record length as described in `docs/PERSISTENCE.md`. A bad checksum in the final record of the last segment is treated as a torn write: truncate that segment to the last good record. A bad checksum in any earlier record fails startup with an error naming the segment and offset. Segment rolling is specified in `docs/PERSISTENCE.md`; retention is not part of the initial persistence preview.
