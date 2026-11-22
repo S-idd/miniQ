@@ -26,6 +26,8 @@
 - [x] Day 16a: opt-in core persistence for publishes and ACKs, restart restoration of offsets/delivery state, shared UTF-8 payload cap, and broker lifecycle integration
 - [x] Day 16a follow-up: canonical SegmentWriter registry keys, single-owner close cleanup, and concurrent cross-topic persistence under lifecycle read/write locking
 - [x] Day 16a append-failure follow-up: classify definite versus ambiguous writes, preserve cap reservations for uncertain records, and fail the affected topic closed
+- [x] Day 16a PR #4 fix: ambiguous append failures keep payload bytes charged and fail the topic closed; definite pre-write failures release the reservation
+- [ ] Day 16b: PAYLOAD_LIMIT protocol error (ProtocolErrorCode, ClientConnection mapping for PayloadLimitException, docs/PROTOCOL.md error-table row, socket-level test that a publish over the cap returns ERR PAYLOAD_LIMIT)
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
 - [ ] Days 18–21: Spring Boot starter and demo apps
 - [ ] Days 22–23: Benchmark and optional @EmbeddedMiniQ
