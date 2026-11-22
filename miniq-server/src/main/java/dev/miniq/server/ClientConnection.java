@@ -13,10 +13,14 @@ import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import dev.miniq.core.Broker;
 import dev.miniq.core.BrokerConfig;
 import dev.miniq.core.Delivery;
+import dev.miniq.core.PayloadLimitException;
+import dev.miniq.core.StorageException;
 import dev.miniq.server.protocol.AckCommand;
 import dev.miniq.server.protocol.Command;
 import dev.miniq.server.protocol.ParseError;
@@ -30,6 +34,7 @@ import dev.miniq.server.protocol.SubscribeCommand;
 
 /** Owns one client socket, its reader, and its single serialized outbound writer. */
 final class ClientConnection implements AutoCloseable {
+    private static final Logger LOGGER = Logger.getLogger(ClientConnection.class.getName());
     private static final int OUTBOUND_CAPACITY = 1_024;
     private static final String STOP = new String("\u0000MINIQ_STOP\u0000");
     private final Broker broker;
@@ -129,6 +134,11 @@ final class ClientConnection implements AutoCloseable {
                     enqueue(ResponseFormatter.ack(broker.ack(connectionId, ack.topic(), ack.offset(), ack.deliveryCount())));
                 }
             }
+        } catch (PayloadLimitException failure) {
+            enqueue(ResponseFormatter.err(ProtocolErrorCode.PAYLOAD_LIMIT, "broker payload limit reached"));
+        } catch (StorageException failure) {
+            LOGGER.log(Level.WARNING, "broker storage operation failed", failure);
+            enqueue(ResponseFormatter.err(ProtocolErrorCode.SERVER_ERROR, "storage error"));
         } catch (IllegalArgumentException failure) {
             enqueue(ResponseFormatter.err(ProtocolErrorCode.SERVER_ERROR,
                     failure.getMessage() == null ? "broker rejected command" : failure.getMessage()));

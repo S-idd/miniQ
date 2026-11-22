@@ -32,6 +32,7 @@ public final class Broker implements AutoCloseable {
     private final Clock clock;
     private final BrokerConfig config;
     private final PayloadBudget payloadBudget;
+    private final RecoveryStats recoveryStats;
     private final TopicRegistry topics;
     private final TimeoutScheduler timeoutScheduler;
     private final ConcurrentMap<String, TopicDelivery> deliveriesByTopic = new ConcurrentHashMap<>();
@@ -46,6 +47,7 @@ public final class Broker implements AutoCloseable {
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
         this.config = Objects.requireNonNull(config, "config must not be null");
         this.payloadBudget = null;
+        this.recoveryStats = new RecoveryStats(0, 0);
         this.timeoutScheduler = new TimeoutScheduler(clock, this::pumpTopic);
         this.topics = new TopicRegistry(config.maxLineBytes(), name ->
                 new Topic(name, config.maxLineBytes(), new InMemoryTopicLog()));
@@ -64,6 +66,8 @@ public final class Broker implements AutoCloseable {
         Objects.requireNonNull(persistenceConfig, "persistenceConfig must not be null");
         RecoveryResult recovered = StorageRecovery.recover(persistenceConfig.dataDirectory(),
                 config.maxLineBytes(), persistenceConfig.payloadCapBytes());
+        this.recoveryStats = new RecoveryStats(recovered.topics().size(), recovered.topics().values().stream()
+                .mapToLong(RecoveredTopic::nextOffset).sum());
         this.payloadBudget = new PayloadBudget(persistenceConfig.payloadCapBytes(), recovered.payloadBytes());
         this.timeoutScheduler = new TimeoutScheduler(clock, this::pumpTopic);
         TopicLogFactory logFactory;
@@ -241,6 +245,11 @@ public final class Broker implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    /** Returns the number of topics and published messages reconstructed during startup recovery. */
+    public RecoveryStats recoveryStats() {
+        return recoveryStats;
     }
 
     @Override
