@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import dev.miniq.core.Broker;
 import dev.miniq.core.BrokerConfig;
 import dev.miniq.core.Delivery;
+import dev.miniq.core.PayloadLimitException;
 import dev.miniq.server.protocol.AckCommand;
 import dev.miniq.server.protocol.Command;
 import dev.miniq.server.protocol.ParseError;
@@ -129,6 +130,9 @@ final class ClientConnection implements AutoCloseable {
                     enqueue(ResponseFormatter.ack(broker.ack(connectionId, ack.topic(), ack.offset(), ack.deliveryCount())));
                 }
             }
+        } catch (PayloadLimitException failure) {
+            enqueue(ResponseFormatter.err(ProtocolErrorCode.PAYLOAD_LIMIT,
+                    failure.getMessage() == null ? "broker payload limit exceeded" : failure.getMessage()));
         } catch (IllegalArgumentException failure) {
             enqueue(ResponseFormatter.err(ProtocolErrorCode.SERVER_ERROR,
                     failure.getMessage() == null ? "broker rejected command" : failure.getMessage()));

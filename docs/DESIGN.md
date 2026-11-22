@@ -88,6 +88,9 @@ Append PUBLISH records before returning a successful PUBLISH response and ACK re
 
 ## Decisions and trade-offs
 
+### Payload cap protocol error
+Map `PayloadLimitException` to the specific `PAYLOAD_LIMIT` wire code so clients can distinguish configured capacity rejection from unexpected broker failures. Keep the connection open because the rejected publish does not corrupt broker state and the client may issue other commands.
+
 ### Competing consumers
 Choose one subscriber per message, with round-robin selection among eligible subscribers. Reject broadcast fan-out because it requires per-subscriber message state and changes the product into pub/sub semantics.
 

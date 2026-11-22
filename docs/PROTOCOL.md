@@ -52,6 +52,7 @@ The complete set of protocol errors is:
 | `ALREADY_SUBSCRIBED` | Connection attempts a second SUBSCRIBE after its first succeeded. |
 | `NOT_SUBSCRIBED` | Connection sends ACK without an active subscription. |
 | `ACK_NOT_IN_FLIGHT` | That topic/offset/attempt is no longer in flight for this connection; this includes expired attempts and unknown offsets. |
+| `PAYLOAD_LIMIT` | A PUBLISH would exceed the broker's configured total UTF-8 payload byte cap. |
 | `SERVER_ERROR` | Unexpected broker-side failure prevented the command from completing. |
 
 Unknown commands and malformed commands receive the corresponding `ERR` line and leave the connection open. Invalid UTF-8, an oversized line, or an incomplete line followed by EOF closes the connection after any possible error response. An ACK received at or after its attempt deadline returns `ACK_NOT_IN_FLIGHT`, even if the timeout worker has not yet processed the deadline or the message has since been redelivered; the delivery count prevents that stale ACK from acknowledging the new attempt. A second SUBSCRIBE returns `ALREADY_SUBSCRIBED` and preserves the original subscription. On disconnect, all deliveries owned by that connection transition back to READY immediately; the broker closes the socket and redelivers them to an available subscriber.

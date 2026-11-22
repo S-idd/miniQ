@@ -3,13 +3,17 @@ package dev.miniq.server;
 import dev.miniq.core.Broker;
 import dev.miniq.core.BrokerConfig;
 import dev.miniq.core.BrokerStats;
+import dev.miniq.core.PersistenceConfig;
+import dev.miniq.core.storage.FsyncMode;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.BufferedWriter;
 import java.io.BufferedInputStream;
 import java.io.OutputStreamWriter;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
@@ -26,6 +30,30 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class MiniqServerSocketTest {
     private static final ConcurrentMap<Socket, BufferedInputStream> INPUTS = new ConcurrentHashMap<>();
+
+    @Test
+    void publishOverConfiguredPayloadCapReturnsPayloadLimitAndKeepsConnectionOpen(@TempDir Path dataDir)
+            throws Exception {
+        BrokerConfig config = new BrokerConfig(5_000, 16, 65_536);
+        Broker broker = new Broker(Clock.systemUTC(), config,
+                new PersistenceConfig(dataDir, FsyncMode.NONE, 3));
+        broker.start();
+        try (MiniqServer server = new MiniqServer(broker, config, 0)) {
+            server.start();
+            try (Socket socket = new Socket("127.0.0.1", server.port())) {
+                socket.setSoTimeout(10_000);
+                socketWrite(socket, "PUBLISH t a");
+                assertThat(read(socket)).isEqualTo("OK 0");
+                socketWrite(socket, "PUBLISH t éé"); // Four UTF-8 bytes exceed the three-byte broker cap.
+                assertThat(read(socket)).startsWith("ERR PAYLOAD_LIMIT");
+                socketWrite(socket, "PUBLISH other ");
+                assertThat(read(socket)).isEqualTo("OK 0");
+            }
+        } finally {
+            broker.close();
+        }
+    }
+
     @Test
     void veryLongUnterminatedLineStopsReadingAtTheConfiguredLimit() throws Exception {
         AtomicInteger consumed = new AtomicInteger();
