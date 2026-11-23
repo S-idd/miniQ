@@ -25,7 +25,10 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -70,6 +73,69 @@ class MiniQPersistenceServerTest {
             publisher.send("PUBLISH orders item-5");
             assertThat(publisher.read()).isEqualTo("OK 5");
         }
+    }
+
+    @Test
+    void recoveryMarkerPrecedesReadyWithRecoveredCounts() throws Exception {
+        Path data = tempDir.resolve("marker-data");
+        try (PersistentRunning first = new PersistentRunning(data);
+             SocketClient publisher = first.connect();
+             SocketClient subscriber = first.connect()) {
+            for (int i = 0; i < 5; i++) {
+                publisher.send("PUBLISH orders item-" + i);
+                assertThat(publisher.read()).isEqualTo("OK " + i);
+            }
+            subscriber.send("SUBSCRIBE orders 300000");
+            assertThat(subscriber.read()).isEqualTo("OK");
+            for (int i = 0; i < 5; i++) {
+                assertThat(subscriber.read()).isEqualTo("MSG orders " + i + " 1 item-" + i);
+            }
+            for (int offset = 0; offset < 2; offset++) {
+                subscriber.send("ACK orders " + offset + " 1");
+                assertThat(subscriber.read()).isEqualTo("OK");
+            }
+        }
+
+        try (RunningMain restarted = new RunningMain(tempDir, "--data-dir", data.toString(), "--port", "0")) {
+            List<String> output = restarted.awaitReady();
+            String marker = "MINIQ_RECOVERED topics=1 messages=5 acked=2";
+            assertThat(output).filteredOn(line -> line.startsWith("MINIQ_RECOVERED "))
+                    .containsExactly(marker);
+            int markerIndex = output.indexOf(marker);
+            int readyIndex = indexOfPrefix(output, "MINIQ_READY ");
+            assertThat(markerIndex).isGreaterThanOrEqualTo(0).isLessThan(readyIndex);
+            assertThat(output.get(readyIndex)).startsWith("MINIQ_READY port=");
+        }
+    }
+
+    @Test
+    void withoutDataDirectoryDoesNotPrintRecoveryMarker() throws Exception {
+        try (RunningMain running = new RunningMain(tempDir, "--port", "0")) {
+            List<String> output = running.awaitReady();
+            assertThat(output).noneMatch(line -> line.startsWith("MINIQ_RECOVERED "));
+            assertThat(output).anyMatch(line -> line.startsWith("MINIQ_READY port="));
+        }
+    }
+
+    @Test
+    void corruptDirectoryPrintsNeitherRecoveryMarkerNorReady() throws Exception {
+        Path data = tempDir.resolve("marker-corrupt-data");
+        try (Broker broker = persistentBroker(data)) {
+            broker.publish("orders", "one");
+            broker.publish("orders", "two");
+        }
+        Path segment;
+        try (var paths = Files.walk(data.resolve("topics"))) {
+            segment = paths.filter(path -> path.getFileName().toString().endsWith(".log"))
+                    .findFirst().orElseThrow();
+        }
+        byte[] bytes = Files.readAllBytes(segment);
+        bytes[32] ^= 0x01;
+        Files.write(segment, bytes);
+
+        ProcessResult result = runMain(data, "--data-dir", data.toString(), "--port", "0");
+        assertThat(result.exitCode()).isEqualTo(1);
+        assertThat(result.output()).doesNotContain("MINIQ_RECOVERED").doesNotContain("MINIQ_READY");
     }
 
     @Test
@@ -193,6 +259,13 @@ class MiniQPersistenceServerTest {
         }
     }
 
+    private static int indexOfPrefix(List<String> lines, String prefix) {
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).startsWith(prefix)) return i;
+        }
+        return -1;
+    }
+
     private static List<String> javaCommand() throws Exception {
         Path java = Path.of(System.getProperty("java.home"), "bin", "java");
         Path serverClasses = Path.of(MiniQServerMain.class.getProtectionDomain().getCodeSource()
@@ -200,6 +273,59 @@ class MiniQPersistenceServerTest {
         Path coreClasses = Path.of(Broker.class.getProtectionDomain().getCodeSource().getLocation().toURI());
         String classpath = serverClasses + System.getProperty("path.separator") + coreClasses;
         return new ArrayList<>(List.of(java.toString(), "-cp", classpath, "dev.miniq.server.MiniQServerMain"));
+    }
+
+    private static final class RunningMain implements AutoCloseable {
+        private static final Optional<String> END_OF_OUTPUT = Optional.empty();
+        private final Process process;
+        private final ExecutorService reader = Executors.newSingleThreadExecutor();
+        private final BlockingQueue<Optional<String>> lines = new LinkedBlockingQueue<>();
+
+        private RunningMain(Path workingDirectory, String... args) throws Exception {
+            List<String> command = javaCommand();
+            command.addAll(List.of(args));
+            process = new ProcessBuilder(command).directory(workingDirectory.toFile())
+                    .redirectErrorStream(true).start();
+            reader.submit(() -> {
+                try (BufferedReader buffered = new BufferedReader(new InputStreamReader(
+                        process.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = buffered.readLine()) != null) lines.put(Optional.of(line));
+                } catch (Exception failure) {
+                    lines.offer(Optional.of("TEST_OUTPUT_READER_ERROR " + failure.getMessage()));
+                } finally {
+                    lines.offer(END_OF_OUTPUT);
+                }
+            });
+        }
+
+        private List<String> awaitReady() throws Exception {
+            List<String> output = new ArrayList<>();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (System.nanoTime() < deadline) {
+                long remaining = deadline - System.nanoTime();
+                Optional<String> next = lines.poll(remaining, TimeUnit.NANOSECONDS);
+                if (next == null) break;
+                if (next.isEmpty()) throw new AssertionError("server exited before MINIQ_READY: " + output);
+                output.add(next.get());
+                if (next.get().startsWith("MINIQ_READY ")) return List.copyOf(output);
+            }
+            throw new AssertionError("timed out waiting for MINIQ_READY: " + output);
+        }
+
+        @Override public void close() throws Exception {
+            process.destroyForcibly();
+            if (!process.waitFor(10, TimeUnit.SECONDS)) {
+                throw new AssertionError("server process did not exit after destroyForcibly");
+            }
+            reader.shutdown();
+            if (!reader.awaitTermination(10, TimeUnit.SECONDS)) {
+                reader.shutdownNow();
+                if (!reader.awaitTermination(10, TimeUnit.SECONDS)) {
+                    throw new AssertionError("server output reader did not stop");
+                }
+            }
+        }
     }
 
     private static Broker persistentBroker(Path data) throws Exception {

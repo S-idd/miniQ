@@ -31,6 +31,7 @@
 - [x] Day 16b: server --data-dir/--fsync wiring, recovery counts, PAYLOAD_LIMIT and fixed storage-error responses, persistence protocol/README documentation, restart and startup-failure socket/process tests, mutation checks, and one-CPU Docker verification
 - [x] Day 16c follow-ups: include untouched recovered topics in stats, make startup shutdown-hook cleanup exception-safe, and assert persistence CLI configuration directly
 - [x] Issue #5 deterministic backpressure: bound server `maxInFlight` by outbound capacity, keep sink offers nonblocking, and test gated writers with small queues and redelivery
+- [x] Day 16d: print `MINIQ_RECOVERED` recovery counts to stderr before the socket-ready marker
 - [ ] Days 13–17: Persistence, Chaos Stage B, tag v0.2
 - [ ] Days 18–21: Spring Boot starter and demo apps
 - [ ] Days 22–23: Benchmark and optional @EmbeddedMiniQ
