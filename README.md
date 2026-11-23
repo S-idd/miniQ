@@ -113,11 +113,11 @@ stateDiagram-v2
 
 ## Chaos demo
 
-The Stage A demo proves at-least-once delivery through a consumer crash: it publishes IDs 1–1000, kills consumer A with SIGKILL after at least 500 distinct IDs have been logged, and lets a fresh consumer receive the remaining work. It verifies every ID appears at least once and reports duplicates and redeliveries. One sample run in [docs/CHAOS.md](docs/CHAOS.md) reports 1,008 total lines, 1,000 distinct IDs, 8 duplicates, and 8 redeliveries; counts vary by run. Stage B, which tests recovery after a broker crash, needs persistence and is not implemented yet.
+The chaos demo runs both Stage A and Stage B locally. Stage A kills a consumer and verifies at-least-once delivery. Stage B kills the broker during publishing, restarts it with the same data directory, and uses the publish-OK log and receive logs to check recovery. Run `scripts/chaos-demo.sh` after building the shaded JARs; see [docs/CHAOS.md](docs/CHAOS.md) for the full acceptance criteria and a sample result.
 
 ## Scope and limitations
 
-MiniQ is single-node and currently in-memory. It supports exactly three commands: `PUBLISH`, `SUBSCRIBE`, and `ACK`. There is no authentication, consumer-group support, or persistence yet. See [FUTURE.md](FUTURE.md) for planned work and [docs/](docs/) for design, protocol, and chaos documentation.
+MiniQ is single-node. Persistence is opt-in through `--data-dir`; the default remains in-memory. It supports exactly three commands: `PUBLISH`, `SUBSCRIBE`, and `ACK`. There is no authentication or consumer-group support. See [FUTURE.md](FUTURE.md) for planned work and [docs/](docs/) for design, protocol, and chaos documentation.
 
 ## Project layout
 

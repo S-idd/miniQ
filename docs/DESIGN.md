@@ -82,7 +82,7 @@ Each subscription has a maximum of 16 in-flight messages by default; this is a c
 
 The server requires `maxInFlight <= outboundCapacity - 2`; the default outbound capacity is 1,024 lines, with two lines reserved for non-MSG replies such as OK and ERR. A full queue disconnects the slow consumer through the normal shutdown path, and `Broker.disconnect()` returns its unacknowledged attempts to READY. Delivery sinks only make a nonblocking queue offer; they never wait for queue space or a timer.
 
-## Persistence preview — v0.2, not built yet
+## Persistence design — v0.2
 
 Each topic will have append-only segment files with a versioned header and length-prefixed records. A record will include record type, topic-local offset, payload bytes (UTF-8 as specified by the wire protocol), and a checksum; payload length is derived from the record length as described in `docs/PERSISTENCE.md`. A bad checksum in the final record of the last segment is treated as a torn write: truncate that segment to the last good record. A bad checksum in any earlier record fails startup with an error naming the segment and offset. Segment rolling is specified in `docs/PERSISTENCE.md`; retention is not part of the initial persistence preview.
 
@@ -246,7 +246,7 @@ Offsets are gapless and monotonic per topic. Competing subscribers hold at most 
 
 ### Known limitations
 
-The broker is single-process and in-memory; restart loses messages and ACK state. There is no networking, protocol parser, persistence, auth, UI, or consumer groups. A slow sink can stall the caller thread that invokes it; server sinks must enqueue quickly to a separate outbound writer. Delivery and ACK bookkeeping grows with the number of published offsets for the life of the process.
+The broker is single-process; without `--data-dir`, restart loses messages and ACK state. Persistence remains opt-in and does not provide clustering, replication, auth, UI, or consumer groups. A slow sink can stall the caller thread that invokes it; server sinks must enqueue quickly to a separate outbound writer. Delivery and ACK bookkeeping grows with the number of published offsets for the life of the process.
 
 ## Implementation notes (Day 16b)
 
@@ -256,3 +256,9 @@ The broker is single-process and in-memory; restart loses messages and ACK state
 - Wire storage failures use a fixed `SERVER_ERROR` message and are logged server-side with their cause; payload-cap failures use `PAYLOAD_LIMIT`. Both errors leave the connection available for later commands.
 - Recovered topics appear in broker stats before their delivery state is initialized; their ready and ACKED counts come from the recovered log.
 - Redelivery counts are in-memory only and reset to zero after broker restart, because delivery attempts are not persisted.
+
+## Implementation notes (Day 17)
+
+- Chaos child processes combine stdout and stderr into one captured stream so recovery and readiness markers can be checked in observed order. Marker waits remain bounded, and teardown forcibly destroys every child.
+- Stage B treats a PUBLISH `OK` log row as the acceptance boundary and ignores torn final rows. Missing and resurrected IDs determine correctness; duplicate, redelivery, and cross-restart counts remain diagnostics.
+- Recovery checks compare each receive phase with the later phases after its restart. ACK rows are paired with the crash that followed them so later ACKs do not make an earlier recovery appear to resurrect messages.

@@ -26,7 +26,7 @@ final class ChaosProcesses implements AutoCloseable {
         command.add(System.getProperty("java.class.path"));
         command.add(mainClass);
         command.addAll(List.of(args));
-        Process process = new ProcessBuilder(command).redirectError(ProcessBuilder.Redirect.INHERIT).start();
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
         Child child = new Child(process);
         children.add(child);
         Thread.ofVirtual().name("chaos-stdout-" + mainClass).start(() -> child.capture(process));
@@ -69,12 +69,36 @@ final class ChaosProcesses implements AutoCloseable {
             }
         }
 
+        List<String> waitForMarkersInOrder(String first, String second, Duration timeout) throws InterruptedException {
+            long deadline = System.nanoTime() + timeout.toNanos();
+            String firstLine = null;
+            while (true) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) throw new AssertionError("Timed out waiting for ordered markers '" + first
+                        + "' then '" + second + "'. Output: " + captured);
+                OutputLine line = output.poll(remaining, TimeUnit.NANOSECONDS);
+                if (line == null || line.eof()) throw new AssertionError("Child exited or timed out before ordered markers '"
+                        + first + "' then '" + second + "'. Output: " + captured);
+                if (firstLine == null) {
+                    if (line.value().startsWith(second)) throw new AssertionError("Marker '" + second
+                            + "' arrived before '" + first + "'. Output: " + captured);
+                    if (line.value().startsWith(first)) firstLine = line.value();
+                } else if (line.value().startsWith(second)) {
+                    return List.of(firstLine, line.value());
+                }
+            }
+        }
+
         int awaitExit(Duration timeout) throws InterruptedException {
             if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
                 throw new AssertionError("Child did not exit within " + timeout + ". Output: " + captured);
             }
             return process.exitValue();
         }
+
+        boolean isAlive() { return process.isAlive(); }
+        int exitValue() { return process.exitValue(); }
+        List<String> lines() { return List.copyOf(captured); }
 
         private void capture(Process childProcess) {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(
