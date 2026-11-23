@@ -38,8 +38,14 @@ public final class MiniQServerMain {
                     ? new Broker(Clock.systemUTC(), config)
                     : new Broker(Clock.systemUTC(), config, persistenceConfig);
             var recovered = broker.recoveryStats();
-            System.err.println("Recovered " + recovered.topicCount() + " topics and "
-                    + recovered.messageCount() + " messages");
+            if (persistenceConfig == null) {
+                System.err.println("Recovered " + recovered.topicCount() + " topics and "
+                        + recovered.messageCount() + " messages");
+            } else {
+                long acked = broker.stats().acked();
+                System.err.println("MINIQ_RECOVERED topics=" + recovered.topicCount()
+                        + " messages=" + recovered.messageCount() + " acked=" + acked);
+            }
             server = new MiniqServer(broker, config, options.port());
             Broker runningBroker = broker;
             MiniqServer runningServer = server;

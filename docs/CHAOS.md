@@ -28,6 +28,8 @@ The script prints clear step-by-step lines like "[3/10] Killing consumer (pid 42
 
 The automated `ChaosSmokeProcessTest` starts the server, publisher, and consumer as separate JVMs from the test classpath. It publishes 200 ids before subscribing, waits for the consumer's ready marker, then polls the consumer log until ids 1–200 are present. The test has bounded marker, process, and log waits and destroys all child JVMs in `@AfterEach`.
 
+At startup, a server using `--data-dir` writes `MINIQ_RECOVERED topics=<N> messages=<M> acked=<A>` to stderr after recovery succeeds; `MINIQ_READY port=<port>` is written to stdout only after the TCP socket is listening. The recovered marker is omitted when persistence is disabled, and neither marker is emitted when recovery fails.
+
 Run the smoke scenario by hand from the repository root:
 
 ```sh
