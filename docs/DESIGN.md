@@ -246,7 +246,7 @@ Offsets are gapless and monotonic per topic. Competing subscribers hold at most 
 
 ### Known limitations
 
-The broker is single-process; without `--data-dir`, restart loses messages and ACK state. Persistence remains opt-in and does not provide clustering, replication, auth, UI, or consumer groups. A slow sink can stall the caller thread that invokes it; server sinks must enqueue quickly to a separate outbound writer. Delivery and ACK bookkeeping grows with the number of published offsets for the life of the process.
+The broker is single-process; without `--data-dir`, restart loses messages and ACK state. Persistence remains opt-in and does not provide clustering, replication, auth, UI, or consumer groups. A slow sink can stall the caller thread that invokes it; server sinks must enqueue quickly to a separate outbound writer. Delivery and ACK bookkeeping grows with the number of published offsets for the life of the process. The payload cap is broker-wide and counts every payload ever published. Two broker processes using one `--data-dir` are not protected from each other. A subscriber whose window approaches the 1,024-slot client dispatcher queue can be dropped when its own expired messages are requeued to it; see `docs/CHAOS.md`.
 
 ## Implementation notes (Day 16b)
 
