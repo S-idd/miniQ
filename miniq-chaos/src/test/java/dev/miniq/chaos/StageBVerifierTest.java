@@ -87,6 +87,16 @@ class StageBVerifierTest {
         assertThat(r.passed()).isFalse();
     }
 
+    @Test void emptyAckLogWithRecoveredAcksFailsResurrectionCheck() throws Exception {
+        var r = StageBVerifier.verify(java.util.List.of(file("empty-ack-before", "1 1\n"),
+                        file("empty-ack-after", "")), java.util.List.of(file("empty-ack-log", "")),
+                file("empty-ack-ok", "1\n"), 1, java.util.List.of(214L));
+        assertThat(r.passed()).isFalse();
+        assertThat(r.ackLogEmptyDespiteRecoveredAcks()).isTrue();
+        assertThat(r.format()).contains("acked log empty: resurrection check not exercised");
+        System.out.println(r.format());
+    }
+
     @Test void noPostRestartIdNotSeenBeforeIsMissingAndFails() throws Exception {
         var r = StageBVerifier.verify(file("before", ""), file("after", ""),
                 file("acked", ""), file("ok", "7\n"), 1);

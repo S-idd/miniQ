@@ -26,6 +26,20 @@ final class ChaosProcesses implements AutoCloseable {
         command.add(System.getProperty("java.class.path"));
         command.add(mainClass);
         command.addAll(List.of(args));
+        Process process = new ProcessBuilder(command).redirectError(ProcessBuilder.Redirect.INHERIT).start();
+        Child child = new Child(process);
+        children.add(child);
+        Thread.ofVirtual().name("chaos-stdout-" + mainClass).start(() -> child.capture(process));
+        return child;
+    }
+
+    Child startCombinedMain(String mainClass, String... args) throws IOException {
+        List<String> command = new ArrayList<>();
+        command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
+        command.add("-cp");
+        command.add(System.getProperty("java.class.path"));
+        command.add(mainClass);
+        command.addAll(List.of(args));
         Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
         Child child = new Child(process);
         children.add(child);

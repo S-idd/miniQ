@@ -32,7 +32,7 @@
 - [x] Day 16c follow-ups: include untouched recovered topics in stats, make startup shutdown-hook cleanup exception-safe, and assert persistence CLI configuration directly
 - [x] Issue #5 deterministic backpressure: bound server `maxInFlight` by outbound capacity, keep sink offers nonblocking, and test gated writers with small queues and redelivery
 - [x] Day 16d: print `MINIQ_RECOVERED` recovery counts to stderr before the socket-ready marker
-- [x] Day 17: Chaos Stage B broker crash/recovery verification, ordered startup-marker capture, script, mutation checks, and acceptance documentation; v0.2 ready to tag
+- [x] Day 17: Chaos Stage B broker crash/recovery verification, ordered startup-marker capture, ACK-log non-vacuity checks, default and EVERY_WRITE coverage for B1–B3, large-window recovery coverage, demo script, mutation checks, and acceptance documentation; v0.2 ready to tag
 - [x] Days 13–17: Persistence and Chaos Stage B complete; v0.2 ready to tag
 - [ ] Days 18–21: Spring Boot starter and demo apps
 - [ ] Days 22–23: Benchmark and optional @EmbeddedMiniQ

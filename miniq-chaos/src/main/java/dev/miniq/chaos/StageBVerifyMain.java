@@ -9,10 +9,12 @@ public final class StageBVerifyMain {
     public static void main(String[] args) {
         try {
             Map<String,String> a = ChaosArgs.parse(args,
-                    Set.of("--before", "--after", "--acked", "--published", "--expected-count"), Set.of());
+                    Set.of("--before", "--after", "--acked", "--published", "--expected-count", "--recovered-acked"),
+                    Set.of());
+            int expected = ChaosArgs.intValue(a, "--expected-count", 1, Integer.MAX_VALUE);
             var report = StageBVerifier.verify(Path.of(a.get("--before")), Path.of(a.get("--after")),
-                    Path.of(a.get("--acked")), Path.of(a.get("--published")),
-                    ChaosArgs.intValue(a, "--expected-count", 1, Integer.MAX_VALUE));
+                    Path.of(a.get("--acked")), Path.of(a.get("--published")), expected,
+                    Long.parseLong(a.get("--recovered-acked")));
             System.out.println(report.format());
             if (!report.passed()) System.exit(1);
         } catch (Exception failure) {

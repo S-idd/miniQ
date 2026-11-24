@@ -18,12 +18,27 @@ public final class StageBVerifier {
         return verify(List.of(before, after), List.of(acked), published, expected);
     }
 
+    public static Report verify(Path before, Path after, Path acked, Path published, int expected,
+                                long recoveredAcked) throws IOException {
+        return verify(List.of(before, after), List.of(acked), published, expected, List.of(recoveredAcked));
+    }
+
     /** Each received log is one process phase; each ACK log belongs to its preceding crash. */
     public static Report verify(List<Path> phases, List<Path> ackedBeforeEachRestart,
                                 Path published, int expected) throws IOException {
+        return verify(phases, ackedBeforeEachRestart, published, expected,
+                java.util.Collections.nCopies(ackedBeforeEachRestart.size(), 0L));
+    }
+
+    /** Recovered ACK counts correspond in order to the ACK logs from each preceding crash. */
+    public static Report verify(List<Path> phases, List<Path> ackedBeforeEachRestart,
+                                Path published, int expected, List<Long> recoveredAckCounts) throws IOException {
         if (phases.isEmpty()) throw new IllegalArgumentException("at least one received-log phase is required");
         if (ackedBeforeEachRestart.size() > phases.size() - 1) {
             throw new IllegalArgumentException("there cannot be more pre-restart ACK logs than restarts");
+        }
+        if (recoveredAckCounts.size() != ackedBeforeEachRestart.size()) {
+            throw new IllegalArgumentException("each ACK log must have a corresponding recovered ACK count");
         }
         Set<Long> ok = readIds(published);
         Map<Long,Integer> allCounts = new HashMap<>(), postRestartMinimum = new HashMap<>();
@@ -39,8 +54,11 @@ public final class StageBVerifier {
         Set<Long> received = new HashSet<>(); phaseIds.forEach(received::addAll);
         Set<Long> missing = new TreeSet<>(ok); missing.removeAll(received);
         Set<Long> resurrected = new TreeSet<>();
+        boolean ackLogEmptyDespiteRecoveredAcks = false;
         for (int i=0; i<ackedBeforeEachRestart.size(); i++) {
             Set<Long> acknowledged = readIds(ackedBeforeEachRestart.get(i));
+            if (recoveredAckCounts.get(i) < 0) throw new IllegalArgumentException("recovered ACK counts cannot be negative");
+            if (recoveredAckCounts.get(i) > 0 && acknowledged.isEmpty()) ackLogEmptyDespiteRecoveredAcks = true;
             for (int later=i+1; later<phaseIds.size(); later++) {
                 Set<Long> overlap = new HashSet<>(acknowledged); overlap.retainAll(phaseIds.get(later));
                 resurrected.addAll(overlap);
@@ -71,10 +89,10 @@ public final class StageBVerifier {
         }
         boolean minimumsStartAtOne = postRestartMinimum.values().stream().allMatch(count -> count == 1);
         boolean pass = missing.isEmpty() && resurrected.isEmpty() && noPostRestartWereSeenBefore
-                && unackedNotRedeliveredWithinBound && minimumsStartAtOne;
+                && unackedNotRedeliveredWithinBound && minimumsStartAtOne && !ackLogEmptyDespiteRecoveredAcks;
         return new Report(ok.size(), missing, resurrected, noPostRestart, beforeIds,
                 noPostRestartWereSeenBefore, unackedNotRedeliveredByPhase, unackedNotRedeliveredWithinBound,
-                duplicates, redeliveries, crossPhaseIds.size(),
+                duplicates, redeliveries, crossPhaseIds.size(), ackLogEmptyDespiteRecoveredAcks,
                 postRestartMinimum, pass);
     }
 
@@ -122,6 +140,7 @@ public final class StageBVerifier {
                          Map<Integer,Set<Long>> unackedNotRedeliveredByPhase,
                          boolean unackedNotRedeliveredWithinBound,
                          int duplicates, int redeliveries, int crossRestartDuplicates,
+                         boolean ackLogEmptyDespiteRecoveredAcks,
                          Map<Long,Integer> postRestartMinimum, boolean passed) {
         public int minPostRestartDeliveryCount() {
             return postRestartMinimum.values().stream().mapToInt(Integer::intValue).min().orElse(0);
@@ -145,7 +164,8 @@ public final class StageBVerifier {
                     + (postRestartMinimum.isEmpty() ? "none" : minPostRestartDeliveryCount())
                     + "\nPost-restart ids checked: " + postRestartMinimum.size()
                     + "\nPost-restart ids whose minimum deliveryCount was not 1: "
-                    + (badRestartCounts.isEmpty() ? "none" : badRestartCounts);
+                    + (badRestartCounts.isEmpty() ? "none" : badRestartCounts)
+                    + (ackLogEmptyDespiteRecoveredAcks ? "\nacked log empty: resurrection check not exercised" : "");
         }
     }
 }

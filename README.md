@@ -113,7 +113,14 @@ stateDiagram-v2
 
 ## Chaos demo
 
-The chaos demo runs both Stage A and Stage B locally. Stage A kills a consumer and verifies at-least-once delivery. Stage B kills the broker during publishing, restarts it with the same data directory, and uses the publish-OK log and receive logs to check recovery. Run `scripts/chaos-demo.sh` after building the shaded JARs; see [docs/CHAOS.md](docs/CHAOS.md) for the full acceptance criteria and a sample result.
+The chaos demo runs both Stage A and Stage B locally. Stage A kills a consumer and verifies at-least-once delivery. Stage B kills the broker during publishing, restarts it with the same data directory, and verifies every publish confirmed with `OK` against the receive and ACK logs. Run it with:
+
+```sh
+mvn -q -DskipTests package
+scripts/chaos-demo.sh
+```
+
+One run reported `Stage B PASS (exit 0): published OK=402, received=403, duplicates=1, redeliveries=0, resurrected=none, recovered messages=402`. Counts vary because the broker is killed while publishing. The automated tests cover the default fsync mode and `EVERY_WRITE`; the max-in-flight-1,000 recovery variant uses a 30-second ACK deadline. See [docs/CHAOS.md](docs/CHAOS.md) for the acceptance rules and limits.
 
 ## Scope and limitations
 

@@ -208,6 +208,8 @@ while [ "$attempt" -lt 300 ]; do
 done
 if [ "$OK_COUNT" -lt 400 ]; then echo "FAIL: timed out waiting for 400 publish OK responses (saw $OK_COUNT)" >&2; exit 1; fi
 if ! kill -0 "$STAGEB_PUBLISHER_PID" 2>/dev/null; then echo 'FAIL: publisher had finished before the broker crash' >&2; exit 1; fi
+ACKED_COUNT=$(awk 'END { print NR + 0 }' "$STAGEB_ACKED" 2>/dev/null || echo 0)
+if [ "$ACKED_COUNT" -lt 1 ]; then echo 'FAIL: Stage B ACK log is empty before broker crash' >&2; exit 1; fi
 
 echo "[8/10] Killing broker (pid $STAGEB_SERVER_PID) with SIGKILL (kill -9)..."
 kill -9 "$STAGEB_SERVER_PID"
@@ -259,7 +261,9 @@ VERIFY_STATUS=1
 while [ "$attempt" -lt 300 ]; do
   VERIFY_STATUS=0
   "$JAVA" -cp "$CHAOS_JAR" dev.miniq.chaos.StageBVerifyMain --before "$STAGEB_BEFORE" --after "$STAGEB_AFTER" \
-    --acked "$STAGEB_ACKED" --published "$STAGEB_OK" --expected-count 1000 >"$TMP/stageb-verify.out" 2>&1 || VERIFY_STATUS=$?
+    --acked "$STAGEB_ACKED" --published "$STAGEB_OK" --expected-count 1000 \
+    --recovered-acked "$(sed -n 's/.*acked=\([0-9][0-9]*\).*/\1/p' "$TMP/stageb-server-after.out" | head -n 1)" \
+    >"$TMP/stageb-verify.out" 2>&1 || VERIFY_STATUS=$?
   if [ "$VERIFY_STATUS" -eq 0 ]; then break; fi
   attempt=$((attempt + 1)); sleep 0.1
 done
