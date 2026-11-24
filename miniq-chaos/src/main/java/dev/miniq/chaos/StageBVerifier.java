@@ -48,6 +48,21 @@ public final class StageBVerifier {
         }
         Set<Long> noPostRestart = new TreeSet<>(ok); noPostRestart.removeAll(postRestartIds);
         boolean noPostRestartWereSeenBefore = beforeIds.containsAll(noPostRestart);
+        Map<Integer,Set<Long>> unackedNotRedeliveredByPhase = new java.util.LinkedHashMap<>();
+        for (int phase=0; phase<phaseIds.size()-1; phase++) {
+            Set<Long> unackedNotRedelivered = new TreeSet<>(phaseIds.get(phase));
+            if (phase < ackedBeforeEachRestart.size()) {
+                unackedNotRedelivered.removeAll(readIds(ackedBeforeEachRestart.get(phase)));
+            }
+            Set<Long> laterReceived = new HashSet<>();
+            for (int later=phase+1; later<phaseIds.size(); later++) laterReceived.addAll(phaseIds.get(later));
+            unackedNotRedelivered.removeAll(laterReceived);
+            if (!unackedNotRedelivered.isEmpty()) {
+                unackedNotRedeliveredByPhase.put(phase+1, unackedNotRedelivered);
+            }
+        }
+        boolean unackedNotRedeliveredWithinBound = unackedNotRedeliveredByPhase.values()
+                .stream().allMatch(ids -> ids.size() <= 1);
         int duplicates = allCounts.values().stream().mapToInt(n -> Math.max(0, n - 1)).sum();
         Set<Long> crossPhaseIds = new HashSet<>();
         for (int i=0; i<phaseIds.size(); i++) for (int j=i+1; j<phaseIds.size(); j++) {
@@ -55,9 +70,11 @@ public final class StageBVerifier {
             crossPhaseIds.addAll(overlap);
         }
         boolean minimumsStartAtOne = postRestartMinimum.values().stream().allMatch(count -> count == 1);
-        boolean pass = missing.isEmpty() && resurrected.isEmpty() && noPostRestartWereSeenBefore && minimumsStartAtOne;
+        boolean pass = missing.isEmpty() && resurrected.isEmpty() && noPostRestartWereSeenBefore
+                && unackedNotRedeliveredWithinBound && minimumsStartAtOne;
         return new Report(ok.size(), missing, resurrected, noPostRestart, beforeIds,
-                noPostRestartWereSeenBefore, duplicates, redeliveries, crossPhaseIds.size(),
+                noPostRestartWereSeenBefore, unackedNotRedeliveredByPhase, unackedNotRedeliveredWithinBound,
+                duplicates, redeliveries, crossPhaseIds.size(),
                 postRestartMinimum, pass);
     }
 
@@ -102,6 +119,8 @@ public final class StageBVerifier {
 
     public record Report(int publishedOk, Set<Long> missing, Set<Long> resurrected, Set<Long> noPostRestart,
                          Set<Long> receivedBeforeRestart, boolean noPostRestartWereSeenBefore,
+                         Map<Integer,Set<Long>> unackedNotRedeliveredByPhase,
+                         boolean unackedNotRedeliveredWithinBound,
                          int duplicates, int redeliveries, int crossRestartDuplicates,
                          Map<Long,Integer> postRestartMinimum, boolean passed) {
         public int minPostRestartDeliveryCount() {
@@ -116,6 +135,9 @@ public final class StageBVerifier {
                     + "\nResurrected ids: " + (resurrected.isEmpty() ? "none" : resurrected)
                     + "\nIds with no post-restart delivery: " + noPostRestart.size()
                     + "\nNo-post-restart ids were received before restart: " + noPostRestartWereSeenBefore
+                    + "\nUnacked and not redelivered ids by consumer phase: " + unackedNotRedeliveredByPhase
+                    + "\nAt most one unacked/no-redelivery id per consumer phase: "
+                    + unackedNotRedeliveredWithinBound
                     + "\nDuplicate count: " + duplicates
                     + "\nRedelivery count (deliveryCount > 1 rows): " + redeliveries
                     + "\nCross-restart duplicate ids: " + crossRestartDuplicates

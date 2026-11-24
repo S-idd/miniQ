@@ -69,6 +69,24 @@ class StageBVerifierTest {
         assertThat(r.receivedBeforeRestart()).containsAll(r.noPostRestart());
     }
 
+    @Test void oneUnackedIdNotRedeliveredAfterRestartPasses() throws Exception {
+        var r = StageBVerifier.verify(file("one-before", "1 1\n"), file("one-after", ""),
+                file("one-acked", ""), file("one-ok", "1\n"), 1);
+        assertThat(r.unackedNotRedeliveredByPhase()).containsKey(1);
+        assertThat(r.unackedNotRedeliveredByPhase().get(1)).containsExactly(1L);
+        assertThat(r.unackedNotRedeliveredWithinBound()).isTrue();
+        assertThat(r.passed()).isTrue();
+    }
+
+    @Test void twoUnackedIdsNotRedeliveredAfterRestartFail() throws Exception {
+        var r = StageBVerifier.verify(file("two-before", "1 1\n2 1\n"), file("two-after", ""),
+                file("two-acked", ""), file("two-ok", "1\n2\n"), 2);
+        assertThat(r.unackedNotRedeliveredByPhase()).containsKey(1);
+        assertThat(r.unackedNotRedeliveredByPhase().get(1)).containsExactly(1L, 2L);
+        assertThat(r.unackedNotRedeliveredWithinBound()).isFalse();
+        assertThat(r.passed()).isFalse();
+    }
+
     @Test void noPostRestartIdNotSeenBeforeIsMissingAndFails() throws Exception {
         var r = StageBVerifier.verify(file("before", ""), file("after", ""),
                 file("acked", ""), file("ok", "7\n"), 1);
