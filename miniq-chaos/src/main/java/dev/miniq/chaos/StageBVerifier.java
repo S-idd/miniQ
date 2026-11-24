@@ -14,22 +14,12 @@ import java.util.TreeSet;
 public final class StageBVerifier {
     private StageBVerifier() { }
 
-    public static Report verify(Path before, Path after, Path acked, Path published, int expected) throws IOException {
-        return verify(List.of(before, after), List.of(acked), published, expected);
-    }
-
     public static Report verify(Path before, Path after, Path acked, Path published, int expected,
                                 long recoveredAcked) throws IOException {
         return verify(List.of(before, after), List.of(acked), published, expected, List.of(recoveredAcked));
     }
 
     /** Each received log is one process phase; each ACK log belongs to its preceding crash. */
-    public static Report verify(List<Path> phases, List<Path> ackedBeforeEachRestart,
-                                Path published, int expected) throws IOException {
-        return verify(phases, ackedBeforeEachRestart, published, expected,
-                java.util.Collections.nCopies(ackedBeforeEachRestart.size(), 0L));
-    }
-
     /** Recovered ACK counts correspond in order to the ACK logs from each preceding crash. */
     public static Report verify(List<Path> phases, List<Path> ackedBeforeEachRestart,
                                 Path published, int expected, List<Long> recoveredAckCounts) throws IOException {
