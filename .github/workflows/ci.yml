@@ -15,8 +15,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # For pull_request events, actions/checkout defaults to the synthetic merge commit
+      # (refs/pull/N/merge), so the built hash differs from the PR branch HEAD. Build the exact
+      # head commit instead, so the hash in the log matches the reviewed commit. Tradeoff: this
+      # no longer tests the result of merging into the base branch; keep the PR branch up to date
+      # with main (or rely on the push run on main after merge) to catch integration breakage.
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Show built commit
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Expected commit: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          echo "Built commit:    $(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
       - name: Set up Java 21
         uses: actions/setup-java@v4
         with:

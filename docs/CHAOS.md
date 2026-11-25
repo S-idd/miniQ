@@ -2,7 +2,7 @@
 
 ## Goal
 
-Prove at-least-once delivery. No message lost; duplicates allowed.
+Prove at-least-once delivery for publishes the broker confirmed with `OK`: no such message is lost; duplicates are allowed. A publish that was sent but not answered with `OK` before a broker crash is outside this guarantee (see Stage B below).
 
 ## Stage A: consumer crash (needs only the in-memory broker, v0.1)
 
@@ -18,7 +18,7 @@ Prove at-least-once delivery. No message lost; duplicates allowed.
 7. Kill the broker itself with kill -9 mid-run.
 8. Restart the broker; it rebuilds state from the log.
 9. Consumers reconnect; remaining messages are delivered.
-10. Verify: no lost messages, and messages acked before the crash are NOT redelivered after recovery.
+10. Verify: every publisher ID whose `PUBLISH` received `OK` is received at least once, and messages acked before the crash are NOT redelivered after recovery. Publishes that never received `OK` are excluded from this check.
 
 ## Script output
 
