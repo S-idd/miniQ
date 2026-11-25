@@ -227,19 +227,32 @@ class MiniQClientIntegrationTest {
     @Test
     void dispatcherQueueOverflowClosesClientAndReturnsInFlightWork() throws Exception {
         try (Running running = new Running(new BrokerConfig(5_000, 16, 65_536));
-             MiniQClient consumer = running.client(5_000, 1);
+             MsgCountingProxy proxy = new MsgCountingProxy(running.server.port(), 3);
+             MiniQClient consumer = MiniQClient.connect("127.0.0.1", proxy.port(), 1_000, 5_000, 1);
              MiniQClient producer = running.client()) {
             CountDownLatch entered = new CountDownLatch(1);
             CountDownLatch release = new CountDownLatch(1);
+            // The handler holds message one until the test releases it or close interrupts the dispatcher,
+            // so the one-slot queue is guaranteed to hold message two when message three arrives.
             consumer.subscribe("overflow", message -> {
                 entered.countDown();
-                release.await(3, TimeUnit.SECONDS);
+                release.await();
             });
-            producer.publish("overflow", "one");
-            assertThat(entered.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
-            producer.publish("overflow", "two");
-            producer.publish("overflow", "three");
-            release.countDown();
+            try {
+                producer.publish("overflow", "one");
+                assertThat(entered.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
+                producer.publish("overflow", "two");
+                producer.publish("overflow", "three");
+                // All three MSG lines have been written to the consumer's socket, in order, before this request.
+                assertThat(proxy.messagesForwarded.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
+                // The reader processes MSG three (the overflow) before it can read this request's reply,
+                // so this call fails whatever the thread scheduling; a client that never closes answers OK.
+                // A separate topic keeps a probe that reached the broker out of the redelivery check below.
+                assertThatThrownBy(() -> consumer.publish("overflow-probe", "closed"))
+                        .isInstanceOf(MiniQException.class);
+            } finally {
+                release.countDown();
+            }
             awaitCondition(() -> running.broker.stats().ready() >= 1);
             try (MiniQClient replacement = running.client()) {
                 ArrayBlockingQueue<Message> redelivered = new ArrayBlockingQueue<>(4);
@@ -248,7 +261,6 @@ class MiniQClientIntegrationTest {
                 assertThat(message).isNotNull();
                 assertThat(message.deliveryCount()).isGreaterThanOrEqualTo(2);
             }
-            assertThatThrownBy(() -> consumer.publish("overflow", "closed")).isInstanceOf(MiniQException.class);
         }
     }
 
@@ -412,6 +424,65 @@ class MiniQClientIntegrationTest {
             writer.write(line);
             writer.write('\n');
             writer.flush();
+        }
+
+        private void closeSockets() {
+            try { if (clientSocket != null) clientSocket.close(); } catch (IOException ignored) { }
+            try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) { }
+        }
+
+        @Override public void close() {
+            try { listener.close(); } catch (IOException ignored) { }
+            closeSockets();
+        }
+    }
+
+    /** Relays one connection line by line and counts MSG lines written to the client. */
+    private static final class MsgCountingProxy implements AutoCloseable {
+        private final ServerSocket listener;
+        private final CountDownLatch messagesForwarded;
+        private volatile Socket clientSocket;
+        private volatile Socket serverSocket;
+
+        private MsgCountingProxy(int serverPort, int expectedMessages) throws IOException {
+            messagesForwarded = new CountDownLatch(expectedMessages);
+            listener = new ServerSocket(0);
+            Thread.ofVirtual().start(() -> relay(serverPort));
+        }
+
+        private int port() { return listener.getLocalPort(); }
+
+        private void relay(int serverPort) {
+            try (Socket downstream = listener.accept();
+                 Socket upstream = new Socket("127.0.0.1", serverPort)) {
+                clientSocket = downstream;
+                serverSocket = upstream;
+                Thread.ofVirtual().start(() -> {
+                    forward(downstream, upstream, false);
+                    closeSockets();
+                });
+                forward(upstream, downstream, true);
+            } catch (IOException ignored) {
+            } finally {
+                closeSockets();
+            }
+        }
+
+        private void forward(Socket from, Socket to, boolean countMessages) {
+            try {
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        from.getInputStream(), StandardCharsets.UTF_8));
+                BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
+                        to.getOutputStream(), StandardCharsets.UTF_8));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    writer.write(line);
+                    writer.write('\n');
+                    writer.flush();
+                    if (countMessages && line.startsWith("MSG ")) messagesForwarded.countDown();
+                }
+            } catch (IOException ignored) {
+            }
         }
 
         private void closeSockets() {
