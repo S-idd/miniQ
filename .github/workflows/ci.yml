@@ -15,21 +15,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      # For pull_request events, actions/checkout defaults to the synthetic merge commit
-      # (refs/pull/N/merge), so the built hash differs from the PR branch HEAD. Build the exact
-      # head commit instead, so the hash in the log matches the reviewed commit. Tradeoff: this
-      # no longer tests the result of merging into the base branch; keep the PR branch up to date
-      # with main (or rely on the push run on main after merge) to catch integration breakage.
       - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      - name: Show built commit
+      # On pull_request events actions/checkout builds the synthetic merge commit
+      # (refs/pull/N/merge), which tests the branch as it would land on the base branch.
+      # Keep that, and print every relevant hash so the built commit can be compared
+      # with the PR branch HEAD. The merge commit's second parent is the PR head.
+      - name: Show built commit hashes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          echo "Event: ${{ github.event_name }}"
-          echo "Expected commit: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
-          echo "Built commit:    $(git rev-parse HEAD)"
-          test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          echo "event:                  $EVENT_NAME"
+          echo "github.ref:             $GITHUB_REF_VALUE"
+          echo "github.sha:             $GITHUB_SHA_VALUE"
+          echo "git rev-parse HEAD:     $(git rev-parse HEAD)"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "pull_request.head.sha:  $PR_HEAD_SHA"
+            echo "pull_request.base.sha:  $PR_BASE_SHA"
+            echo "built commit parents:   $(git cat-file -p HEAD | sed -n 's/^parent //p' | tr '\n' ' ')"
+          fi
       - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
