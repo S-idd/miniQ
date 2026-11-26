@@ -113,11 +113,18 @@ stateDiagram-v2
 
 ## Chaos demo
 
-The Stage A demo proves at-least-once delivery through a consumer crash: it publishes IDs 1–1000, kills consumer A with SIGKILL after at least 500 distinct IDs have been logged, and lets a fresh consumer receive the remaining work. It verifies every ID appears at least once and reports duplicates and redeliveries. One sample run in [docs/CHAOS.md](docs/CHAOS.md) reports 1,008 total lines, 1,000 distinct IDs, 8 duplicates, and 8 redeliveries; counts vary by run. Stage B, which tests recovery after a broker crash, needs persistence and is not implemented yet.
+The chaos demo runs both Stage A and Stage B locally. Stage A kills a consumer and verifies at-least-once delivery. Stage B kills the broker during publishing, restarts it with the same data directory, and verifies every publish confirmed with `OK` against the receive and ACK logs. Run it with:
+
+```sh
+mvn -q -DskipTests package
+scripts/chaos-demo.sh
+```
+
+One run reported `Stage B PASS (exit 0): published OK=402, received=403, duplicates=1, redeliveries=0, resurrected=none, recovered messages=402`. Counts vary because the broker is killed while publishing. The automated tests cover the default fsync mode and `EVERY_WRITE`; the max-in-flight-1,000 recovery variant uses a 30-second ACK deadline. See [docs/CHAOS.md](docs/CHAOS.md) for the acceptance rules and limits.
 
 ## Scope and limitations
 
-MiniQ is single-node and currently in-memory. It supports exactly three commands: `PUBLISH`, `SUBSCRIBE`, and `ACK`. There is no authentication, consumer-group support, or persistence yet. See [FUTURE.md](FUTURE.md) for planned work and [docs/](docs/) for design, protocol, and chaos documentation.
+MiniQ is single-node. Persistence is opt-in through `--data-dir`; the default remains in-memory. It supports exactly three commands: `PUBLISH`, `SUBSCRIBE`, and `ACK`. There is no authentication or consumer-group support. See [FUTURE.md](FUTURE.md) for planned work and [docs/](docs/) for design, protocol, and chaos documentation.
 
 ## Project layout
 

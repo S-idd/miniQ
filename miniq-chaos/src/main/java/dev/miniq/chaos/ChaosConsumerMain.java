@@ -23,7 +23,7 @@ public final class ChaosConsumerMain {
 
     public static void main(String[] args) {
         try {
-            Map<String, String> options = ChaosArgs.parse(args, REQUIRED, Set.of("--delay-ms"));
+            Map<String, String> options = ChaosArgs.parse(args, REQUIRED, Set.of("--delay-ms", "--acked-log"));
             String host = options.get("--host");
             if (host.isBlank()) throw new IllegalArgumentException("--host must not be blank");
             int port = ChaosArgs.intValue(options, "--port", 1, 65_535);
@@ -32,13 +32,17 @@ public final class ChaosConsumerMain {
                     ? longValue(options.get("--delay-ms"), "--delay-ms", 0, Integer.MAX_VALUE) : 0;
             String topic = options.get("--topic");
             Path logPath = Path.of(options.get("--log")).toAbsolutePath();
+            Path ackedPath = options.containsKey("--acked-log") ? Path.of(options.get("--acked-log")).toAbsolutePath() : null;
             Path parent = logPath.getParent();
             if (parent != null) Files.createDirectories(parent);
+            if (ackedPath != null && ackedPath.getParent() != null) Files.createDirectories(ackedPath.getParent());
 
             try (FileChannel log = FileChannel.open(logPath, StandardOpenOption.CREATE,
                     StandardOpenOption.WRITE, StandardOpenOption.APPEND);
+                 FileChannel ackedLog = ackedPath == null ? null : FileChannel.open(ackedPath, StandardOpenOption.CREATE,
+                         StandardOpenOption.WRITE, StandardOpenOption.APPEND);
                  MiniQClient client = MiniQClient.connect(host, port, 5_000, 1_000)) {
-                client.subscribe(topic, ackTimeoutMs, message -> processMessage(client, log, message, delayMs));
+                client.subscribe(topic, ackTimeoutMs, message -> processMessage(client, log, ackedLog, message, delayMs));
                 System.out.println("CHAOS_CONSUMER_READY");
                 System.out.flush();
 
@@ -59,7 +63,7 @@ public final class ChaosConsumerMain {
         }
     }
 
-    private static void processMessage(MiniQClient client, FileChannel log, Message message,
+    private static void processMessage(MiniQClient client, FileChannel log, FileChannel ackedLog, Message message,
                                        long delayMs) throws Exception {
         long id = Long.parseLong(message.payload());
         if (id < 1) throw new IllegalArgumentException("message payload id must be positive");
@@ -70,7 +74,14 @@ public final class ChaosConsumerMain {
         // SIGKILL does not discard bytes already written to the OS; fsync only matters for power loss, which
         // Stage A does not test, and per-message fsync is slow enough to push ACKs past the ack timeout.
         if (delayMs > 0) Thread.sleep(delayMs);
-        if (!client.ack(message)) System.err.println("late ack for id " + id);
+        if (client.ack(message)) {
+            if (ackedLog != null) appendLine(ackedLog, Long.toString(id));
+        } else System.err.println("late ack for id " + id);
+    }
+
+    private static void appendLine(FileChannel channel, String value) throws IOException {
+        ByteBuffer bytes = ByteBuffer.wrap((value + System.lineSeparator()).getBytes(StandardCharsets.UTF_8));
+        while (bytes.hasRemaining()) channel.write(bytes);
     }
 
     private static long longValue(String raw, String name, long min, long max) {

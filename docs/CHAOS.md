@@ -2,7 +2,7 @@
 
 ## Goal
 
-Prove at-least-once delivery. No message lost; duplicates allowed.
+Prove at-least-once delivery for publishes the broker confirmed with `OK`: no such message is lost; duplicates are allowed. A publish that was sent but not answered with `OK` before a broker crash is outside this guarantee (see Stage B below).
 
 ## Stage A: consumer crash (needs only the in-memory broker, v0.1)
 
@@ -18,7 +18,7 @@ Prove at-least-once delivery. No message lost; duplicates allowed.
 7. Kill the broker itself with kill -9 mid-run.
 8. Restart the broker; it rebuilds state from the log.
 9. Consumers reconnect; remaining messages are delivered.
-10. Verify: no lost messages, and messages acked before the crash are NOT redelivered after recovery.
+10. Verify: every publisher ID whose `PUBLISH` received `OK` is received at least once, and messages acked before the crash are NOT redelivered after recovery. Publishes that never received `OK` are excluded from this check.
 
 ## Script output
 
@@ -50,7 +50,7 @@ Then start the consumer (which writes each `id deliveryCount` row directly to th
 java -cp "$CHAOS_CP" dev.miniq.chaos.ChaosConsumerMain --host 127.0.0.1 --port <port> --topic orders --log /tmp/miniq-received.log --ack-timeout-ms 500
 ```
 
-After `CHAOS_CONSUMER_READY`, check that every id is present with `awk 'NF == 2 { seen[$1] = 1 } END { for (i = 1; i <= 200; i++) if (!seen[i]) exit 1 }' /tmp/miniq-received.log`. Stop the consumer and server processes after the check. The full Stage A kill-and-redeliver acceptance run remains the next chaos milestone.
+After `CHAOS_CONSUMER_READY`, check that every id is present with `awk 'NF == 2 { seen[$1] = 1 } END { for (i = 1; i <= 200; i++) if (!seen[i]) exit 1 }' /tmp/miniq-received.log`. Stop the consumer and server processes after the check. The separate Stage A and Stage B acceptance runs are described below.
 
 The consumer does not fsync each row. Stage A tests process termination with `SIGKILL`, which does not discard bytes already written to the operating system; fsync is needed for power loss, which Stage A does not test. Per-message fsync is slow enough to push ACKs past the 500 ms ACK timeout. If redelivery makes an ACK stale, the consumer reports `late ack for id X` to stderr and continues, as expected with at-least-once delivery.
 
@@ -71,7 +71,7 @@ mvn -q -DskipTests package
 scripts/chaos-demo.sh
 ```
 
-The script does not build anything. If either shaded JAR is missing, it prints the package command and exits. It runs the same 1,000-message consumer-crash scenario, prints the `ChaosVerifyMain` report, and cleans up background processes with a trap. The Stage B broker-crash steps are reported as skipped because persistence is not implemented yet.
+The script does not build anything. If either shaded JAR is missing, it prints the package command and exits. It runs Stage A and Stage B in separate server processes, prints the `ChaosVerifyMain` and `StageBVerifyMain` reports, and cleans up child processes and its temporary data directory with a trap.
 
 Example report (the counts vary by run):
 
@@ -87,3 +87,44 @@ Stage A PASS (exit 0): duplicate count=8, redelivery count=8
 ```
 
 PASS means each expected id from 1 through 1000 appears at least once. Duplicate deliveries are allowed by the at-least-once guarantee; redelivery count counts log rows whose delivery count is greater than one.
+
+## Run Stage B (broker crash and recovery)
+
+Build the shaded JARs once, then run the demo from the repository root:
+
+```sh
+mvn -q -DskipTests package
+scripts/chaos-demo.sh
+```
+
+The script keeps the Stage A consumer-crash run, then creates a temporary data directory for Stage B. It starts the broker with `--data-dir` and `--ack-timeout-ms 500`, starts a publisher with a 2 ms delay and an OK log, and starts Consumer A with a 5 ms delay and an ACK log. After at least 400 confirmed publish responses, it kills the broker with `kill -9` while publishing is still active. The publisher exits non-zero if the connection breaks before all publishes return OK; the script only requires messages in the OK log to be recovered. It checks for lock-like files, restarts the server on the same data directory, verifies `MINIQ_RECOVERED` precedes `MINIQ_READY`, then starts a fresh Consumer B.
+
+`StageBVerifyMain` invokes the same pure-Java `StageBVerifier` used by JUnit. It tolerates a torn final log line and reports published-OK IDs, missing IDs, resurrected IDs, duplicate rows, redelivery rows, cross-restart duplicates, the minimum post-restart delivery count, and the number of OK IDs with no post-restart delivery. PASS requires no missing IDs, no ACKed-before-crash ID received after restart, every OK ID with no post-restart delivery to have appeared before the crash, and a minimum post-restart delivery count of 1 for every ID received after restart. For each consumer phase preceding a crash, the number of distinct received IDs that are absent from that phase's ACK log and all later receive phases must be at most one. This bound assumes each consumer processes messages sequentially in this order: write the received row, wait for its configured delay, send ACK, then write the ACKed row. A concurrent consumer, a consumer that ACKs before logging, or a consumer with multiple ACKs in flight can leave more than one ACK whose response was not recorded; that invalidates the bound and requires a different verifier model. Redelivery and duplicate counts are diagnostics and do not determine PASS.
+
+Before every automated Stage B broker kill, the test asserts that the corresponding ACK log has at least one complete row. It passes that ACK log and the restart's recovered ACK count to `StageBVerifier`. If the broker reports recovered ACKs while the ACK log is empty, verification fails with `acked log empty: resurrection check not exercised`. The script also checks that its ACK log is non-empty before the kill and passes the recovered ACK count to the verifier.
+
+Example from one script run (counts vary because the broker is killed during publishing):
+
+```text
+Stage B verification: PASS
+Published OK ids: 417
+Missing ids: none
+Resurrected ids: none
+Ids with no post-restart delivery: 182
+No-post-restart ids were received before restart: true
+Duplicate count: 1
+Redelivery count (deliveryCount > 1 rows): 0
+Cross-restart duplicate ids: 1
+Minimum post-restart deliveryCount: 1
+Post-restart ids checked: 235
+Post-restart ids whose minimum deliveryCount was not 1: none
+Stage B PASS (exit 0): published OK=417, received=418, duplicates=1, redeliveries=0, resurrected=none, recovered messages=417
+```
+
+The automated Stage B process tests cover both `--fsync NONE` (the default) and `--fsync EVERY_WRITE` for B1, B2, and B3. B1 also covers `--max-in-flight 1` and `--max-in-flight 1000`; the 1,000-window case uses a 30-second ACK deadline and verifies large-backlog recovery rather than short-deadline behavior. The default mode tests process-crash recovery; the `EVERY_WRITE` variants exercise the same process-kill scenarios with per-record forcing. Neither setting tests an operating-system or power failure. See the final verification record in the project history for the run counts and mutation results.
+
+The Stage B test and script do not promise recovery from power loss when using the default `--fsync NONE`; use `--fsync EVERY_WRITE` for forced writes, subject to filesystem and device behavior. A publish sent to the broker but not answered with OK may or may not be present after a crash, so it is excluded from the no-loss check. Do not run two broker processes against the same data directory; cross-process directory locking is not implemented.
+
+### Large windows and slow consumers
+
+A subscriber whose window is close to its 1,024-slot client dispatcher queue can be dropped when its own expired messages are requeued to it, because it cannot drain a full window inside the ACK deadline. The client dispatcher fills and closes the connection; the broker then returns that subscriber's messages to `READY`. This was observed with a recovered 1,000-message backlog on one CPU; it was not reproduced in the in-memory case. The max-in-flight-1,000 Stage B variant uses a 30-second ACK deadline to verify recovery of a large backlog with a large window, not ACK-deadline behavior. The default and max-in-flight-1 variants continue to use 500 ms.
