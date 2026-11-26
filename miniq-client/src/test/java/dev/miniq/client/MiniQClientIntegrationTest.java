@@ -226,33 +226,58 @@ class MiniQClientIntegrationTest {
 
     @Test
     void dispatcherQueueOverflowClosesClientAndReturnsInFlightWork() throws Exception {
+        long replyTimeoutMs = 5_000;
+        String overflowClose = "message dispatcher queue is full";
         try (Running running = new Running(new BrokerConfig(5_000, 16, 65_536));
              MsgCountingProxy proxy = new MsgCountingProxy(running.server.port(), 3);
-             MiniQClient consumer = MiniQClient.connect("127.0.0.1", proxy.port(), 1_000, 5_000, 1);
+             MiniQClient consumer = MiniQClient.connect("127.0.0.1", proxy.port(), 1_000, replyTimeoutMs, 1);
              MiniQClient producer = running.client()) {
             CountDownLatch entered = new CountDownLatch(1);
             CountDownLatch release = new CountDownLatch(1);
+            CountDownLatch handlerExited = new CountDownLatch(1);
+            AtomicBoolean releaseTimedOut = new AtomicBoolean();
             // The handler holds message one until the test releases it or close interrupts the dispatcher,
             // so the one-slot queue is guaranteed to hold message two when message three arrives.
+            // The wait is bounded; a handler nobody releases is reported below instead of blocking forever.
             consumer.subscribe("overflow", message -> {
                 entered.countDown();
-                release.await();
+                try {
+                    if (!release.await(WAIT_SECONDS, TimeUnit.SECONDS)) releaseTimedOut.set(true);
+                } finally {
+                    handlerExited.countDown();
+                }
             });
             try {
                 producer.publish("overflow", "one");
                 assertThat(entered.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
                 producer.publish("overflow", "two");
                 producer.publish("overflow", "three");
-                // All three MSG lines have been written to the consumer's socket, in order, before this request.
+                // All three MSG lines have been written to the consumer's socket, in order.
                 assertThat(proxy.messagesForwarded.await(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
-                // The reader processes MSG three (the overflow) before it can read this request's reply,
-                // so this call fails whatever the thread scheduling; a client that never closes answers OK.
+                // The proxy sees EOF from the consumer only after the client closed its own socket,
+                // which shutdown() does after recording the close reason.
+                assertThat(proxy.clientDisconnected.await(WAIT_SECONDS, TimeUnit.SECONDS))
+                        .as("consumer did not close its connection within %d s of the overflow", WAIT_SECONDS)
+                        .isTrue();
+                // The client is already closed, so the probe fails in ensureOpen() without touching the wire,
+                // carrying the recorded close reason; a reply timeout would take replyTimeoutMs and say so.
                 // A separate topic keeps a probe that reached the broker out of the redelivery check below.
+                long probeStart = System.nanoTime();
                 assertThatThrownBy(() -> consumer.publish("overflow-probe", "closed"))
-                        .isInstanceOf(MiniQException.class);
+                        .isInstanceOf(MiniQException.class)
+                        .hasMessageContaining(overflowClose);
+                long probeMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - probeStart);
+                assertThat(probeMillis)
+                        .as("closed-client probe took %d ms; reply timeout is %d ms", probeMillis, replyTimeoutMs)
+                        .isLessThan(replyTimeoutMs / 5);
             } finally {
                 release.countDown();
             }
+            assertThat(handlerExited.await(2 * WAIT_SECONDS, TimeUnit.SECONDS))
+                    .as("overflow handler did not return").isTrue();
+            assertThat(releaseTimedOut.get())
+                    .as("overflow handler was neither released nor interrupted within %d s", WAIT_SECONDS)
+                    .isFalse();
             awaitCondition(() -> running.broker.stats().ready() >= 1);
             try (MiniQClient replacement = running.client()) {
                 ArrayBlockingQueue<Message> redelivered = new ArrayBlockingQueue<>(4);
@@ -261,6 +286,10 @@ class MiniQClientIntegrationTest {
                 assertThat(message).isNotNull();
                 assertThat(message.deliveryCount()).isGreaterThanOrEqualTo(2);
             }
+            // The replacement subscription did not reopen or replace the original consumer.
+            assertThatThrownBy(() -> consumer.publish("overflow-probe", "still closed"))
+                    .isInstanceOf(MiniQException.class)
+                    .hasMessageContaining(overflowClose);
         }
     }
 
@@ -437,10 +466,11 @@ class MiniQClientIntegrationTest {
         }
     }
 
-    /** Relays one connection line by line and counts MSG lines written to the client. */
+    /** Relays one connection line by line, counts MSG lines written to the client, and observes client EOF. */
     private static final class MsgCountingProxy implements AutoCloseable {
         private final ServerSocket listener;
         private final CountDownLatch messagesForwarded;
+        private final CountDownLatch clientDisconnected = new CountDownLatch(1);
         private volatile Socket clientSocket;
         private volatile Socket serverSocket;
 
@@ -481,6 +511,9 @@ class MiniQClientIntegrationTest {
                     writer.flush();
                     if (countMessages && line.startsWith("MSG ")) messagesForwarded.countDown();
                 }
+                // Clean EOF on the client-to-server direction means the client closed its socket;
+                // a proxy-initiated close surfaces as an IOException instead and is not counted.
+                if (!countMessages) clientDisconnected.countDown();
             } catch (IOException ignored) {
             }
         }
