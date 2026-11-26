@@ -12,3 +12,7 @@
 - Release ACKed payloads from memory / compaction (the 256 MiB cap counts every payload ever published).
 - Log a warning with the discarded byte count whenever recovery truncates a torn tail.
 - Remove or test the redundant non-final torn-tail check in StorageRecovery.
+- Actuator health indicator.
+- JSON payload conversion.
+- Opt-in retry policy with an idempotency warning.
+- Metrics.

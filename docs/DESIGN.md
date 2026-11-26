@@ -262,3 +262,9 @@ The broker is single-process; without `--data-dir`, restart loses messages and A
 - Chaos child processes combine stdout and stderr into one captured stream so recovery and readiness markers can be checked in observed order. Marker waits remain bounded, and teardown forcibly destroys every child.
 - Stage B treats a PUBLISH `OK` log row as the acceptance boundary and ignores torn final rows. Missing and resurrected IDs determine correctness; duplicate, redelivery, and cross-restart counts remain diagnostics.
 - Recovery checks compare each receive phase with the later phases after its restart. ACK rows are paired with the crash that followed them so later ACKs do not make an earlier recovery appear to resurrect messages.
+
+## Implementation notes (Day 18)
+
+- Reconnect rule: a `MiniQException` with an error code is a broker reply on a healthy connection, so `MiniQTemplate` keeps the client. Without a code, the client has failed or closed itself (connect, write, reply timeout, EOF), so the template discards it and the next `send` reconnects. `send` never retries, because a lost reply can hide a stored publish.
+- `MiniQConnectionManager` holds its lock only to create or discard the client, never during a publish. A stalled broker reply therefore cannot block other threads from discarding a failed client, from reconnecting or from closing the context. Discard clears the client only when it is the same instance, so a late failure from an old client cannot drop a newer one.
+- The starter uses one shared client because `publish` is thread-safe and FIFO-pipelined. A MiniQ connection holds one subscription handler, so future listeners will each need their own client. Property validation uses Spring's `Validator` on the properties class, so no Jakarta Validation provider is required.

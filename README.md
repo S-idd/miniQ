@@ -57,6 +57,41 @@ class Example {
 
 The subscription handler receives each `Message`; `autoAck=true` acknowledges it after the handler returns successfully. Start the server with the quickstart command first; its default port is 7070.
 
+## Spring Boot (preview)
+
+The starter auto-configures a `MiniQTemplate` for publishing. It is built against Spring Boot 4.1.2. Install it locally with `mvn install`, then add:
+
+```xml
+<dependency>
+  <groupId>dev.miniq</groupId>
+  <artifactId>miniq-spring-boot-starter</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+</dependency>
+```
+
+Properties, with their defaults:
+
+```properties
+miniq.enabled=true
+miniq.host=localhost
+miniq.port=7070
+miniq.connect-timeout-ms=2000
+miniq.reply-timeout-ms=5000
+```
+
+```java
+@Component
+record OrderPublisher(MiniQTemplate miniQ) {
+    long publish(String json) { return miniQ.send("orders", json); } // returns the offset
+}
+```
+
+- The connection is created on the first `send`, so the application starts even when no broker is running. All sends share one connection.
+- `send` does not retry. A failed publish may already have been stored, so a retry could duplicate it.
+- After a connection failure, `send` throws `MiniQException` and the next `send` reconnects. A broker error such as `PAYLOAD_LIMIT` throws with an error code and keeps the connection.
+- An invalid property value (blank host, port outside 1–65535, timeout below 1) fails startup. `miniq.enabled=false` registers no MiniQ beans.
+- Listeners (consuming messages through Spring) are not available yet. Use `MiniQClient.subscribe` directly.
+
 ## Wire protocol cheat sheet
 
 MiniQ uses UTF-8 text over TCP, with one LF-terminated command or response per line. The three client commands are:
