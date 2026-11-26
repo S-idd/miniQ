@@ -29,7 +29,10 @@ public final class MiniQTemplate {
      *       rejected the command, the connection stays open, and the exception is rethrown.</li>
      *   <li>{@link IllegalArgumentException} for an invalid topic or a payload containing CR or LF:
      *       thrown by client-side validation before anything is sent; the connection stays open.</li>
+     *   <li>{@link NullPointerException} if {@code topic} or {@code payload} is null.</li>
      * </ul>
+     *
+     * <p>A reply timeout means the broker may already have stored the message, so a retry can duplicate it.
      */
     public long send(String topic, String payload) {
         MiniQClient client = connectionManager.acquire();
