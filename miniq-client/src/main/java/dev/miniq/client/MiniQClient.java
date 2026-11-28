@@ -21,6 +21,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -47,6 +48,8 @@ public final class MiniQClient implements AutoCloseable {
     private volatile MessageHandler handler;
     private volatile boolean autoAck;
     private boolean subscribed;
+    /** Test seam: how shutdown() interrupts the reader and dispatcher, so a test can make that step throw. */
+    volatile Consumer<Thread> threadInterrupter = Thread::interrupt;
 
     private MiniQClient(Socket socket, long replyTimeoutMs, int queueCapacity) throws IOException {
         this.socket = socket;
@@ -172,6 +175,8 @@ public final class MiniQClient implements AutoCloseable {
      * closing the connection, and when {@link #close()} is called; it never reopens. When this returns
      * true, the close cause is recorded, the socket is closed and outstanding requests have failed, so
      * every later call throws {@link MiniQException} with that cause. Waiting does not close the client.
+     * Do not call this from the client's own reader or dispatcher thread, for example inside a
+     * {@link MessageHandler}: it can wait forever for a close that only that thread could complete.
      *
      * @return true if the client closed within the timeout, false if the timeout elapsed first
      * @throws InterruptedException if the calling thread is interrupted before or while waiting; the
@@ -357,15 +362,18 @@ public final class MiniQClient implements AutoCloseable {
 
     private void shutdown(MiniQException failure) {
         if (!closed.compareAndSet(false, true)) return;
-        closeFailure = failure;
-        try { socket.close(); } catch (IOException ignored) { }
-        Thread current = Thread.currentThread();
-        if (reader != current) reader.interrupt();
-        if (dispatcher != current) dispatcher.interrupt();
-        Pending item;
-        while ((item = pending.poll()) != null) item.result.completeExceptionally(failure);
-        messages.clear();
-        closedLatch.countDown(); // Last: observers of isClosed/awaitClosed see the cause, socket and pending all settled.
+        try {
+            closeFailure = failure;
+            try { socket.close(); } catch (IOException ignored) { }
+            Thread current = Thread.currentThread();
+            if (reader != current) threadInterrupter.accept(reader);
+            if (dispatcher != current) threadInterrupter.accept(dispatcher);
+            Pending item;
+            while ((item = pending.poll()) != null) item.result.completeExceptionally(failure);
+            messages.clear();
+        } finally {
+            closedLatch.countDown(); // Last: observers of isClosed/awaitClosed see the cause, socket and pending all settled.
+        }
     }
 
     private void ensureOpen() { if (closed.get()) throw currentFailure(); }

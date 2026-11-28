@@ -287,6 +287,26 @@ class MiniQClientClosedStateTest {
         }
     }
 
+    @Test
+    void closedLatchIsReleasedEvenIfAShutdownStepThrows() throws Exception {
+        try (Running running = new Running()) {
+            MiniQClient client = running.client();
+            IllegalStateException injected = new IllegalStateException("injected shutdown failure");
+            // close() runs shutdown() on this thread, so the reader and then the dispatcher pass through the seam
+            // in that order. Both are interrupted as usual; the throw after the dispatcher skips the rest of
+            // shutdown() at a fixed point, with no other thread involved.
+            client.threadInterrupter = thread -> {
+                thread.interrupt();
+                if (thread.getName().equals("miniq-client-dispatcher")) throw injected;
+            };
+            assertThatThrownBy(client::close).isSameAs(injected);
+            assertThat(client.isClosed()).isTrue();
+            assertThat(client.awaitClosed(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> client.publish("after-throw", "x"))
+                    .isInstanceOf(MiniQException.class).hasMessage("client is closed");
+        }
+    }
+
     private interface Call { void run() throws Exception; }
 
     private static Throwable catchFailure(Call call) {
