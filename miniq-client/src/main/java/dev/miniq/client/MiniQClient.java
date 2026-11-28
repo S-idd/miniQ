@@ -16,6 +16,7 @@ import java.util.OptionalLong;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -39,6 +40,7 @@ public final class MiniQClient implements AutoCloseable {
     private final Object writeLock = new Object();
     private final Object subscribeLock = new Object();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final CountDownLatch closedLatch = new CountDownLatch(1);
     private final Thread reader;
     private final Thread dispatcher;
     private volatile MiniQException closeFailure;
@@ -153,6 +155,32 @@ public final class MiniQClient implements AutoCloseable {
     }
 
     @Override public void close() { shutdown(new MiniQException("client is closed")); }
+
+    /**
+     * Returns whether this client has finished closing. A client closes itself permanently after a reply
+     * timeout, a write failure, a dispatcher queue overflow or the server closing the connection, and
+     * when {@link #close()} is called; it never reopens. Once this returns true, the close cause is
+     * recorded, the socket is closed and outstanding requests have failed, so every later call throws
+     * {@link MiniQException} with that cause. A call made while the close is still in progress can
+     * already fail before this returns true.
+     */
+    public boolean isClosed() { return closedLatch.getCount() == 0; }
+
+    /**
+     * Waits until this client has finished closing, for at most the given time. A client closes itself
+     * permanently after a reply timeout, a write failure, a dispatcher queue overflow or the server
+     * closing the connection, and when {@link #close()} is called; it never reopens. When this returns
+     * true, the close cause is recorded, the socket is closed and outstanding requests have failed, so
+     * every later call throws {@link MiniQException} with that cause. Waiting does not close the client.
+     *
+     * @return true if the client closed within the timeout, false if the timeout elapsed first
+     * @throws InterruptedException if the calling thread is interrupted before or while waiting; the
+     *     thread's interrupt status is cleared, and the client is left as it was
+     */
+    public boolean awaitClosed(long timeout, TimeUnit unit) throws InterruptedException {
+        Objects.requireNonNull(unit, "unit must not be null");
+        return closedLatch.await(timeout, unit);
+    }
 
     private String request(String line) {
         Pending item = enqueueRequest(line);
@@ -337,6 +365,7 @@ public final class MiniQClient implements AutoCloseable {
         Pending item;
         while ((item = pending.poll()) != null) item.result.completeExceptionally(failure);
         messages.clear();
+        closedLatch.countDown(); // Last: observers of isClosed/awaitClosed see the cause, socket and pending all settled.
     }
 
     private void ensureOpen() { if (closed.get()) throw currentFailure(); }
