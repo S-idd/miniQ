@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -55,6 +56,7 @@ class MiniQClientClosedStateTest {
                 assertThat(outcome[0]).as("awaitClosed result on an open client (1 = true)").isZero();
                 assertThat(outcome[1]).as("awaitClosed returned before its 100 ms timeout")
                         .isGreaterThanOrEqualTo(TimeUnit.MILLISECONDS.toNanos(100));
+                assertThat(outcome[1]).as("awaitClosed(100 ms) took over 5 s").isLessThan(TimeUnit.SECONDS.toNanos(5));
             } finally {
                 executor.shutdownNow();
             }
@@ -304,6 +306,87 @@ class MiniQClientClosedStateTest {
             assertThat(client.awaitClosed(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
             assertThatThrownBy(() -> client.publish("after-throw", "x"))
                     .isInstanceOf(MiniQException.class).hasMessage("client is closed");
+            // The stored cause is one instance; the currentFailure() fallback builds a new one per call, and its
+            // message is also "client is closed", so only identity shows the cause was stored before the throw.
+            Throwable first = catchFailure(() -> client.publish("after-throw", "y"));
+            Throwable second = catchFailure(() -> client.publish("after-throw", "z"));
+            assertThat(first).isInstanceOf(MiniQException.class).hasMessage("client is closed");
+            assertThat(second).isInstanceOf(MiniQException.class).isSameAs(first);
+        }
+    }
+
+    @Test
+    void aSecondShutdownThatLosesTheRaceDoesNotReleaseTheLatch() throws Exception {
+        try (Running running = new Running()) {
+            MiniQClient client = running.client();
+            AtomicBoolean readerTerminated = new AtomicBoolean();
+            AtomicReference<Boolean> isClosedDuringFirstShutdown = new AtomicReference<>();
+            AtomicReference<Boolean> awaitClosedDuringFirstShutdown = new AtomicReference<>();
+            AtomicReference<Throwable> seamFailure = new AtomicReference<>();
+            ExecutorService probe = Executors.newSingleThreadExecutor();
+            // close() runs the first shutdown() on this thread; it has already closed the socket when it hands the
+            // reader to the seam. The closed socket makes the reader's blocked read fail, so the reader calls
+            // shutdown() itself, loses the compareAndSet, and exits. Joining it here means that losing call has
+            // fully finished while the first shutdown() is still in progress.
+            client.threadInterrupter = thread -> {
+                if (thread.getName().equals("miniq-client-reader")) {
+                    try {
+                        readerTerminated.set(thread.join(Duration.ofSeconds(WAIT_SECONDS)));
+                        isClosedDuringFirstShutdown.set(client.isClosed());
+                        // Probe on another thread: only this close() can release the latch, so a wait here that
+                        // ignored its timeout must time out the probe instead of hanging the test.
+                        awaitClosedDuringFirstShutdown.set(probe.submit(() -> client.awaitClosed(0, TimeUnit.SECONDS))
+                                .get(WAIT_SECONDS, TimeUnit.SECONDS));
+                    } catch (Throwable failure) {
+                        seamFailure.set(failure);
+                    }
+                }
+                thread.interrupt();
+            };
+            try {
+                client.close();
+            } finally {
+                probe.shutdownNow();
+            }
+            assertThat(seamFailure.get()).isNull();
+            assertThat(readerTerminated.get()).as("reader did not terminate within %d s of the socket closing", WAIT_SECONDS)
+                    .isTrue();
+            assertThat(isClosedDuringFirstShutdown.get()).as("isClosed() while the first shutdown was running").isFalse();
+            assertThat(awaitClosedDuringFirstShutdown.get()).as("awaitClosed(0) while the first shutdown was running")
+                    .isFalse();
+            assertThat(client.isClosed()).isTrue();
+        }
+    }
+
+    @Test
+    void closeInterruptsAHandlerBlockedInOnMessage() throws Exception {
+        try (Running running = new Running(); MiniQClient producer = running.client()) {
+            MiniQClient consumer = running.client();
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch neverReleased = new CountDownLatch(1);
+            CountDownLatch handlerReturned = new CountDownLatch(1);
+            AtomicReference<InterruptedException> received = new AtomicReference<>();
+            try {
+                consumer.subscribe("blocked-handler", message -> {
+                    entered.countDown();
+                    try {
+                        neverReleased.await();
+                    } catch (InterruptedException interrupted) {
+                        received.set(interrupted);
+                    } finally {
+                        handlerReturned.countDown();
+                    }
+                });
+                producer.publish("blocked-handler", "hold");
+                assertThat(entered.await(WAIT_SECONDS, TimeUnit.SECONDS)).as("handler was not entered").isTrue();
+                consumer.close();
+                assertThat(handlerReturned.await(WAIT_SECONDS, TimeUnit.SECONDS))
+                        .as("close() did not interrupt the handler within %d s", WAIT_SECONDS).isTrue();
+                assertThat(received.get()).isInstanceOf(InterruptedException.class);
+            } finally {
+                neverReleased.countDown(); // Never leave the dispatcher blocked after the test, pass or fail.
+                consumer.close();
+            }
         }
     }
 

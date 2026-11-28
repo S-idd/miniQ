@@ -160,9 +160,11 @@ public final class MiniQClient implements AutoCloseable {
     @Override public void close() { shutdown(new MiniQException("client is closed")); }
 
     /**
-     * Returns whether this client has finished closing. A client closes itself permanently after a reply
-     * timeout, a write failure, a dispatcher queue overflow or the server closing the connection, and
-     * when {@link #close()} is called; it never reopens. When the close completes normally, by the time
+     * Returns whether this client has finished closing. A client closes permanently when {@link #close()}
+     * is called, and closes itself in other cases too, for example after a reply timeout, a write failure,
+     * a dispatcher queue overflow or the server closing the connection, when a request is interrupted while
+     * waiting for its reply, when reading from the server fails or a response line is too long, or when the
+     * dispatcher stops unexpectedly; it never reopens. When the close completes normally, by the time
      * this returns true the close cause is recorded, the socket is closed and outstanding requests have
      * failed, so every later call throws {@link MiniQException} with that cause. If the shutdown itself
      * unexpectedly throws (for example an {@link Error}), this still turns true so callers are not left
@@ -172,9 +174,11 @@ public final class MiniQClient implements AutoCloseable {
     public boolean isClosed() { return closedLatch.getCount() == 0; }
 
     /**
-     * Waits until this client has finished closing, for at most the given time. A client closes itself
-     * permanently after a reply timeout, a write failure, a dispatcher queue overflow or the server
-     * closing the connection, and when {@link #close()} is called; it never reopens. When the close
+     * Waits until this client has finished closing, for at most the given time. A client closes permanently
+     * when {@link #close()} is called, and closes itself in other cases too, for example after a reply
+     * timeout, a write failure, a dispatcher queue overflow or the server closing the connection, when a
+     * request is interrupted while waiting for its reply, when reading from the server fails or a response
+     * line is too long, or when the dispatcher stops unexpectedly; it never reopens. When the close
      * completes normally, by the time this returns true the close cause is recorded, the socket is closed
      * and outstanding requests have failed, so every later call throws {@link MiniQException} with that
      * cause. If the shutdown itself unexpectedly throws (for example an {@link Error}), waiters are still
