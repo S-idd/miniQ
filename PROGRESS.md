@@ -35,6 +35,7 @@
 - [x] Day 17: Chaos Stage B broker crash/recovery verification, ordered startup-marker capture, ACK-log non-vacuity checks, default and EVERY_WRITE coverage for B1–B3, large-window recovery coverage, demo script, mutation checks, and acceptance documentation; v0.2 ready to tag
 - [x] Days 13–17: Persistence and Chaos Stage B complete; v0.2 ready to tag
 - [x] Day 18: Spring Boot starter auto-configuration, validated `miniq.*` properties, `MiniQTemplate`, and a lazily connecting manager that discards on connection-level failures; real-broker, concurrency, descriptor-leak and mutation coverage
+- [x] Day 18c: `MiniQClient.isClosed()` and `awaitClosed(timeout, unit)`, released only after the close cause, socket and pending requests are settled; real-server, reply-timeout, 16-waiter, interrupt and 200-round stored-cause tests, six mutation checks, and one-CPU Docker verification
 - [ ] Days 18–21: Spring Boot starter and demo apps
 - [ ] Days 22–23: Benchmark and optional @EmbeddedMiniQ
 - [ ] Days 24–25: Packaging and demo only (script, README, recording)

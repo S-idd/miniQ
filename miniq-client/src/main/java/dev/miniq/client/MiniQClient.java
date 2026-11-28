@@ -16,10 +16,12 @@ import java.util.OptionalLong;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -39,12 +41,15 @@ public final class MiniQClient implements AutoCloseable {
     private final Object writeLock = new Object();
     private final Object subscribeLock = new Object();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final CountDownLatch closedLatch = new CountDownLatch(1);
     private final Thread reader;
     private final Thread dispatcher;
     private volatile MiniQException closeFailure;
     private volatile MessageHandler handler;
     private volatile boolean autoAck;
     private boolean subscribed;
+    /** Test seam only; must stay package-private. Lets a test make shutdown()'s interrupt step throw. */
+    volatile Consumer<Thread> threadInterrupter = Thread::interrupt;
 
     private MiniQClient(Socket socket, long replyTimeoutMs, int queueCapacity) throws IOException {
         this.socket = socket;
@@ -153,6 +158,42 @@ public final class MiniQClient implements AutoCloseable {
     }
 
     @Override public void close() { shutdown(new MiniQException("client is closed")); }
+
+    /**
+     * Returns whether this client has finished closing. A client closes permanently when {@link #close()}
+     * is called, and closes itself in other cases too, for example after a reply timeout, a write failure,
+     * a dispatcher queue overflow or the server closing the connection, when a request is interrupted while
+     * waiting for its reply, when reading from the server fails or a response line is too long, or when the
+     * dispatcher stops unexpectedly; it never reopens. When the close completes normally, by the time
+     * this returns true the close cause is recorded, the socket is closed and outstanding requests have
+     * failed, so every later call throws {@link MiniQException} with that cause. If the shutdown itself
+     * unexpectedly throws (for example an {@link Error}), this still turns true so callers are not left
+     * waiting, but that cleanup may be incomplete. A call made while the close is still in progress can
+     * already fail before this returns true.
+     */
+    public boolean isClosed() { return closedLatch.getCount() == 0; }
+
+    /**
+     * Waits until this client has finished closing, for at most the given time. A client closes permanently
+     * when {@link #close()} is called, and closes itself in other cases too, for example after a reply
+     * timeout, a write failure, a dispatcher queue overflow or the server closing the connection, when a
+     * request is interrupted while waiting for its reply, when reading from the server fails or a response
+     * line is too long, or when the dispatcher stops unexpectedly; it never reopens. When the close
+     * completes normally, by the time this returns true the close cause is recorded, the socket is closed
+     * and outstanding requests have failed, so every later call throws {@link MiniQException} with that
+     * cause. If the shutdown itself unexpectedly throws (for example an {@link Error}), waiters are still
+     * released so they are not stuck, but that cleanup may be incomplete. Waiting does not close the client.
+     * Do not call this from the client's own reader or dispatcher thread, for example inside a
+     * {@link MessageHandler}: it can wait forever for a close that only that thread could complete.
+     *
+     * @return true if the client closed within the timeout, false if the timeout elapsed first
+     * @throws InterruptedException if the calling thread is interrupted before or while waiting; the
+     *     thread's interrupt status is cleared, and the client is left as it was
+     */
+    public boolean awaitClosed(long timeout, TimeUnit unit) throws InterruptedException {
+        Objects.requireNonNull(unit, "unit must not be null");
+        return closedLatch.await(timeout, unit);
+    }
 
     private String request(String line) {
         Pending item = enqueueRequest(line);
@@ -329,14 +370,20 @@ public final class MiniQClient implements AutoCloseable {
 
     private void shutdown(MiniQException failure) {
         if (!closed.compareAndSet(false, true)) return;
-        closeFailure = failure;
-        try { socket.close(); } catch (IOException ignored) { }
-        Thread current = Thread.currentThread();
-        if (reader != current) reader.interrupt();
-        if (dispatcher != current) dispatcher.interrupt();
-        Pending item;
-        while ((item = pending.poll()) != null) item.result.completeExceptionally(failure);
-        messages.clear();
+        try {
+            closeFailure = failure;
+            try { socket.close(); } catch (IOException ignored) { }
+            Thread current = Thread.currentThread();
+            if (reader != current) threadInterrupter.accept(reader);
+            if (dispatcher != current) threadInterrupter.accept(dispatcher);
+            Pending item;
+            while ((item = pending.poll()) != null) item.result.completeExceptionally(failure);
+            messages.clear();
+        } finally {
+            // Released last, in a finally. On a normal shutdown the cause, socket and pending requests are settled
+            // before it; if an earlier step throws, the latch is still released so waiters are not stuck.
+            closedLatch.countDown();
+        }
     }
 
     private void ensureOpen() { if (closed.get()) throw currentFailure(); }
