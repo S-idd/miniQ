@@ -48,7 +48,7 @@ public final class MiniQClient implements AutoCloseable {
     private volatile MessageHandler handler;
     private volatile boolean autoAck;
     private boolean subscribed;
-    /** Test seam: how shutdown() interrupts the reader and dispatcher, so a test can make that step throw. */
+    /** Test seam only; must stay package-private. Lets a test make shutdown()'s interrupt step throw. */
     volatile Consumer<Thread> threadInterrupter = Thread::interrupt;
 
     private MiniQClient(Socket socket, long replyTimeoutMs, int queueCapacity) throws IOException {
@@ -162,9 +162,11 @@ public final class MiniQClient implements AutoCloseable {
     /**
      * Returns whether this client has finished closing. A client closes itself permanently after a reply
      * timeout, a write failure, a dispatcher queue overflow or the server closing the connection, and
-     * when {@link #close()} is called; it never reopens. Once this returns true, the close cause is
-     * recorded, the socket is closed and outstanding requests have failed, so every later call throws
-     * {@link MiniQException} with that cause. A call made while the close is still in progress can
+     * when {@link #close()} is called; it never reopens. When the close completes normally, by the time
+     * this returns true the close cause is recorded, the socket is closed and outstanding requests have
+     * failed, so every later call throws {@link MiniQException} with that cause. If the shutdown itself
+     * unexpectedly throws (for example an {@link Error}), this still turns true so callers are not left
+     * waiting, but that cleanup may be incomplete. A call made while the close is still in progress can
      * already fail before this returns true.
      */
     public boolean isClosed() { return closedLatch.getCount() == 0; }
@@ -172,9 +174,11 @@ public final class MiniQClient implements AutoCloseable {
     /**
      * Waits until this client has finished closing, for at most the given time. A client closes itself
      * permanently after a reply timeout, a write failure, a dispatcher queue overflow or the server
-     * closing the connection, and when {@link #close()} is called; it never reopens. When this returns
-     * true, the close cause is recorded, the socket is closed and outstanding requests have failed, so
-     * every later call throws {@link MiniQException} with that cause. Waiting does not close the client.
+     * closing the connection, and when {@link #close()} is called; it never reopens. When the close
+     * completes normally, by the time this returns true the close cause is recorded, the socket is closed
+     * and outstanding requests have failed, so every later call throws {@link MiniQException} with that
+     * cause. If the shutdown itself unexpectedly throws (for example an {@link Error}), waiters are still
+     * released so they are not stuck, but that cleanup may be incomplete. Waiting does not close the client.
      * Do not call this from the client's own reader or dispatcher thread, for example inside a
      * {@link MessageHandler}: it can wait forever for a close that only that thread could complete.
      *
@@ -372,7 +376,9 @@ public final class MiniQClient implements AutoCloseable {
             while ((item = pending.poll()) != null) item.result.completeExceptionally(failure);
             messages.clear();
         } finally {
-            closedLatch.countDown(); // Last: observers of isClosed/awaitClosed see the cause, socket and pending all settled.
+            // Released last, in a finally. On a normal shutdown the cause, socket and pending requests are settled
+            // before it; if an earlier step throws, the latch is still released so waiters are not stuck.
+            closedLatch.countDown();
         }
     }
 
